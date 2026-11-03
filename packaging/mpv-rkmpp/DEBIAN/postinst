@@ -1,0 +1,40 @@
+#!/bin/sh
+# mpv-rkmpp postinst：核对 rkmpp-stack 版本一致，给出用法提示
+set -e
+
+STACK_VER="$(dpkg-query -W -f='${Version}' rkmpp-stack 2>/dev/null || echo 未安装)"
+MY_VER="$(dpkg-query -W -f='${Version}' mpv-rkmpp 2>/dev/null || echo 未知)"
+
+echo "== mpv-rkmpp 安装自检 =="
+echo "rkmpp-stack: $STACK_VER / mpv-rkmpp: $MY_VER"
+
+# libplacebo 装进 /usr/local/lib，不在 dpkg 的 ldconfig trigger 范围内
+if command -v ldconfig >/dev/null 2>&1; then ldconfig; fi
+
+if [ "$STACK_VER" != "$MY_VER" ]; then
+  echo "[警告] 两包版本不一致！mpv 链接的是同批 ffmpeg SONAME，混用可能崩溃。"
+  echo "       请同批升级：apt install ./rkmpp-stack_*.deb ./mpv-rkmpp_*.deb"
+fi
+
+if ldd /usr/local/bin/mpv 2>/dev/null | grep -q '/usr/local/lib/ffmpeg-rkmpp/libavcodec'; then
+  echo "[OK] mpv 已链接 bundled ffmpeg（/usr/local/lib/ffmpeg-rkmpp）"
+else
+  echo "[警告] mpv 未链接 bundled ffmpeg，硬解不可用"
+fi
+
+# 硬解能力自检：补丁生效时 --hwdec=rkmpp 才会出现
+if /usr/local/bin/mpv --hwdec=help 2>&1 | grep -q rkmpp; then
+  echo "[OK] --hwdec=rkmpp 可用"
+else
+  echo "[警告] mpv 不支持 --hwdec=rkmpp（rkmpp 补丁缺失）"
+fi
+
+cat <<'EOF'
+用法（X11 桌面内）：
+  8bit 片源:  mpv --profile=fast --hwdec=rkmpp 文件
+  10bit 片源: mpv --profile=fast --hwdec=rkmpp --vd-lavc-o=afbc=on \
+                   --vf=scale_rkrga=force_yuv=auto 文件
+验证硬解生效（另开终端）：watch -n1 cat /proc/mpp_service/load
+EOF
+
+exit 0

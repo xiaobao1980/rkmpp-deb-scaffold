@@ -1,0 +1,17 @@
+Package: rkmpp-stack
+Version: @VERSION@
+Section: video
+Priority: optional
+Architecture: arm64
+Maintainer: local-build <noreply@local>
+Depends: libdrm2, libasound2, zlib1g, libgnutls30, libstdc++6, libgcc-s1
+Conflicts: librockchip-mpp1, librockchip-mpp-dev
+Description: Rockchip MPP/RGA + ffmpeg-rockchip 硬解运行栈（vendor 内核）
+ 内含 MPP（jellyfin-mpp）、librga（jellyfin-rga）与
+ nyanmisaka/ffmpeg-rockchip（--enable-rkmpp --enable-rkrga，shared），
+ MPP/RGA 装到 /usr/local，ffmpeg 单独装到 /usr/local/lib/ffmpeg-rkmpp
+ 并以 RPATH 自闭合：不写 ldconfig 默认路径，不与发行版自带 ffmpeg
+ 或用户自建的 /usr/local ffmpeg 互相顶包。
+ 仅适用于 Rockchip vendor/BSP 5.10 或 6.1 内核（/dev/mpp_service、/dev/rga）。
+ 覆盖 Debian 12/13、Ubuntu 24.04/26.04、deepin 25（glibc >= 2.36）。
+ 装后请运行：sudo rkmpp-verify

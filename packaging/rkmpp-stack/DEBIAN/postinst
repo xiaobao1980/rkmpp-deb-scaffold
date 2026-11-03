@@ -1,0 +1,67 @@
+#!/bin/sh
+# rkmpp-stack postinst：装时自检并留证，不阻断安装（exit 恒 0）
+set -e
+
+LOG=/var/log/rkmpp-stack-postinst.log
+{
+echo "== rkmpp-stack 环境自检 $(date -Is) =="
+
+K="$(uname -r)"
+echo "kernel: $K"
+if echo "$K" | grep -Eq 'rkr|rockchip|rk3[0-9]'; then
+  echo "[OK] vendor 内核特征匹配"
+else
+  echo "[警告] 内核名不含 rkr/rockchip 特征——若非 Rockchip vendor 5.10/6.1 内核，rkmpp 将无法工作"
+fi
+
+# 先让本包自带的 99-rkmpp-permissions.rules 生效：
+# vendor 内核里 /dev/mpp_service、/dev/rga 默认是 root:root 0600，
+# 而 Rockchip 的 rockchip-multimedia-config 在 Debian/Ubuntu/deepin 官方镜像上并不存在。
+if command -v udevadm >/dev/null 2>&1; then
+  udevadm control --reload-rules >/dev/null 2>&1 || true
+  # mpp_service 属自定义 class（mpp_class），不能按 misc 子系统 trigger，按节点名触发
+  for d in /dev/mpp_service /dev/rga; do
+    if [ -e "$d" ]; then
+      udevadm trigger --action=change --name-match="$d" >/dev/null 2>&1 || true
+    fi
+  done
+  echo "[OK] udev 规则已重载（99-rkmpp-permissions.rules）"
+else
+  echo "[提示] 无 udevadm（容器内？），设备权限需由宿主机保证"
+fi
+
+MISS=0
+for d in /dev/mpp_service /dev/rga /dev/dri /dev/dma_heap; do
+  if [ ! -e "$d" ]; then
+    echo "[警告] 缺少 $d"; MISS=1
+  else
+    echo "[OK] $d  $(ls -ld "$d" | awk '{print $1, $3":"$4}')"
+  fi
+done
+[ "$MISS" = 1 ] && echo "[警告] 设备节点不全：确认 vendor 内核 + 设备已授权（docker 需 --device 映射）"
+
+# 普通用户必须在 video 组（root 不受限）；dpkg 由 sudo 触发时 SUDO_USER 有值
+U="${SUDO_USER:-}"
+if [ -n "$U" ] && [ "$U" != root ]; then
+  if id -nG "$U" 2>/dev/null | tr ' ' '\n' | grep -qx video; then
+    echo "[OK] $U 已在 video 组"
+  else
+    echo "[警告] $U 不在 video 组：sudo usermod -aG video $U ，重新登录后硬解才可用"
+  fi
+fi
+
+# MPP/RGA 落在 /usr/local/lib，不在 dpkg 的 ldconfig trigger 覆盖范围内，必须手动刷新缓存
+if command -v ldconfig >/dev/null 2>&1; then
+  ldconfig && echo "[OK] ldconfig 已刷新（/usr/local/lib）"
+fi
+
+if /usr/local/bin/ffmpeg -hide_banner -decoders 2>/dev/null | grep -q rkmpp; then
+  echo "[OK] ffmpeg rkmpp 解码器在位"
+else
+  echo "[警告] ffmpeg rkmpp 解码器自检失败"
+fi
+
+echo "完整硬件验机（含 RGA/MPP 实测）：sudo rkmpp-verify"
+} 2>&1 | tee -a "$LOG"
+
+exit 0

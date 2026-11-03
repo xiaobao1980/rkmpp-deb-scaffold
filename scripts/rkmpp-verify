@@ -1,0 +1,113 @@
+#!/bin/sh
+# rkmpp-verify：板端硬解验机脚本（rkmpp-stack 包附带，/usr/local/sbin/rkmpp-verify）
+# 退出码：0 全部通过；2 内核不符；3 设备节点缺失；4 ffmpeg 组件缺失；5 RGA 实测失败；6 MPP 编解码实测失败
+set -u
+
+FF=/usr/local/bin/ffmpeg
+PASS=0; FAIL=0
+ok()   { echo "[OK]   $1"; PASS=$((PASS+1)); }
+fail() { echo "[FAIL] $1"; FAIL=$((FAIL+1)); }
+
+echo "==================== rkmpp 板端验机 ===================="
+
+# 0. ffmpeg 是否在位（缺失时后续 $FF 调用会连续失败，提前给出明确原因）
+if [ ! -x "$FF" ]; then
+  echo "[FAIL] 找不到 $FF —— rkmpp-stack 未装好？"
+  exit 4
+fi
+
+# 1. 内核
+K="$(uname -r)"
+echo "内核: $K"
+# 注意：Armbian/厂商镜像常见 6.1.172-vendor-rk35xx 这种命名，含 rk35 但不含 rkr/rockchip，
+# 只匹配 rkr|rockchip 会把能硬解的机器误判成非 vendor 内核。
+echo "$K" | grep -Eq 'rkr|rockchip|rk3[0-9]' && ok "vendor 内核特征" || { fail "非 vendor 内核特征（期望 5.10/6.1 rkr*/rockchip/rk3xxx）"; exit 2; }
+
+# 2. 设备节点（存在性 + 当前用户能否读写；只查存在会漏掉 udev 规则/用户组问题）
+MISS=0
+dev_rw() {
+  d="$1"
+  if [ ! -e "$d" ]; then
+    fail "缺少 $d"; MISS=1; return
+  fi
+  if [ -r "$d" ] && [ -w "$d" ]; then
+    ok "$d"
+  else
+    fail "$d 权限不足：$(ls -ld "$d" | awk '{print $1, $3":"$4}')"
+    MISS=1
+  fi
+}
+dev_rw /dev/mpp_service
+dev_rw /dev/rga
+# /dev/dri 是目录，普通用户本来就没有写权限；真正要查的是 render/card 节点
+if [ -d /dev/dri ]; then
+  R="$(ls /dev/dri/renderD1* 2>/dev/null | head -n1)"
+  if [ -n "$R" ]; then dev_rw "$R"; else dev_rw /dev/dri/card0; fi
+else
+  fail "缺少 /dev/dri"; MISS=1
+fi
+# dma_heap 目录只需可进入，子堆节点才是真正要读写的东西
+if [ -d /dev/dma_heap ] && [ -x /dev/dma_heap ]; then
+  ok "/dev/dma_heap（可进入）"
+  H="$(ls /dev/dma_heap/system 2>/dev/null | head -n1)"
+  if [ -n "$H" ]; then dev_rw "$H"; fi
+else
+  fail "/dev/dma_heap 不可进入"; MISS=1
+fi
+if [ "$MISS" = 1 ]; then
+  echo "        └ 当前用户 $(id -un)：需在 video 组 → sudo usermod -aG video $(id -un) ，重新登录后再试"
+  echo "        └ 设备授权规则：dpkg -L rkmpp-stack | grep rkmpp-permissions（装后需 udevadm control --reload-rules）"
+  exit 3
+fi
+
+# 3. ffmpeg 组件清单
+D="$($FF -hide_banner -decoders 2>/dev/null | grep -c rkmpp)"
+E="$($FF -hide_banner -encoders 2>/dev/null | grep -c rkmpp)"
+F="$($FF -hide_banner -filters  2>/dev/null | grep -c rkrga)"
+echo "rkmpp 解码器 $D 个 / 编码器 $E 个 / rkrga 滤镜 $F 个"
+[ "$D" -ge 9 ] && ok "解码器清单" || { fail "解码器不足"; exit 4; }
+[ "$E" -ge 3 ] && ok "编码器清单" || { fail "编码器不足"; exit 4; }
+[ "$F" -ge 3 ] && ok "rkrga 滤镜清单" || { fail "rkrga 滤镜不足"; exit 4; }
+
+# 4. MPP 硬编码实测（先产出一段测试片，供后面硬解/RGA 复用）
+PROBE=/tmp/rkmpp_probe.mp4
+rm -f "$PROBE"
+if $FF -hide_banner -loglevel error -f lavfi \
+     -i testsrc=size=1920x1080:duration=2:rate=30 \
+     -c:v hevc_rkmpp -b:v 2M -y "$PROBE" && [ -s "$PROBE" ]; then
+  ok "hevc_rkmpp 硬编码实测"
+else
+  fail "hevc_rkmpp 硬编码实测"; exit 6
+fi
+
+# 5. MPP 硬解码实测（解刚编的片）
+if $FF -hide_banner -loglevel error -hwaccel rkmpp -i "$PROBE" -f null - ; then
+  ok "rkmpp 硬解码实测"
+else
+  fail "rkmpp 硬解码实测"; rm -f "$PROBE"; exit 6
+fi
+
+# 6. RGA 实测（1080p → 720p 缩放走硬件）
+# scale_rkrga 只吃 drm_prime（硬件帧）：用 lavfi 软帧直接喂会报
+# "Impossible to convert between the formats supported by ..."，
+# 所以必须 -hwaccel rkmpp -hwaccel_output_format drm_prime 解上面那段测试片。
+if $FF -hide_banner -loglevel error -hwaccel rkmpp -hwaccel_output_format drm_prime \
+     -i "$PROBE" -vf scale_rkrga=w=1280:h=720:format=nv12 \
+     -c:v hevc_rkmpp -f null - ; then
+  ok "RGA 缩放实测（drm_prime 1920x1080 → 1280x720）"
+else
+  fail "RGA 缩放实测"; rm -f "$PROBE"; exit 5
+fi
+rm -f "$PROBE"
+
+echo "==========================================================="
+echo "结果: $PASS 项通过 / $FAIL 项失败"
+[ "$FAIL" = 0 ] && echo "验机通过：rkmpp 栈可投入使用。" || exit 1
+
+cat <<'EOF'
+mpv 播放验证（装了 mpv-rkmpp 的机器）：
+  mpv --profile=fast --hwdec=rkmpp 你的视频
+硬解生效旁证（另开终端，播放时执行）：
+  watch -n1 cat /proc/mpp_service/load    # 负载应非 0
+EOF
+exit 0

@@ -1,0 +1,17 @@
+# 打包产物
+out/
+*.deb
+
+# 本地编译树（build.sh 在容器内用，宿主偶尔跑也会留下这些）
+/build/
+build/
+*.o
+*.so
+*.a
+
+# macOS / 编辑器
+.DS_Store
+*.swp
+
+# 工作区私有数据（记忆、缓存），不随仓库发布
+.workbuddy/

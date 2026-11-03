@@ -1,0 +1,17 @@
+# rkmpp-stack：Rockchip vendor 内核 MPP / RGA / DMA-HEAP 设备授权兜底
+#
+# 背景：/dev/mpp_service 在 vendor 内核里默认 root:root 0600，普通用户打不开。
+# Rockchip BSP 靠专有包 rockchip-multimedia-config 里的
+# 99-rk-device-permissions.rules 授权；该包在 Debian 12/13、Ubuntu 官方镜像、
+# deepin 25 上都不存在，本文件补齐同样的授权。
+#
+# 与 rockchip-multimedia-config 共存：文件名按字典序排在其后
+#（"99-rk-" < "99-rkm"），取值相同，谁生效结果一致，不会冲突。
+
+KERNEL=="mpp_service",         MODE="0660", GROUP="video"
+KERNEL=="rga",                 MODE="0660", GROUP="video"
+KERNEL=="system",              MODE="0660", GROUP="video"
+KERNEL=="cma",                 MODE="0660", GROUP="video"
+KERNEL=="system-dma32",        MODE="0666", GROUP="video"
+KERNEL=="system-uncached",     MODE="0666", GROUP="video"
+KERNEL=="system-uncached-dma32", MODE="0666", GROUP="video"

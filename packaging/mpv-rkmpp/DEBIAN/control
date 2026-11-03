@@ -1,0 +1,18 @@
+Package: mpv-rkmpp
+Version: @VERSION@
+Section: video
+Priority: optional
+Architecture: arm64
+Maintainer: local-build <noreply@local>
+Depends: rkmpp-stack (= @VERSION@), libass9, liblua5.2-0, libegl1, libgl1, libx11-6, libxext6, libxrandr2, libxss1, libxpresent1, libgbm1, libasound2, libpulse0, libffi8, libwayland-client0, libwayland-cursor0, libwayland-egl1, libxkbcommon0
+Conflicts: mpv
+Description: mpv 播放器（rkmpp 硬解版，链接 bundled ffmpeg）
+ 链接 rkmpp-stack 包中 /usr/local/lib/ffmpeg-rkmpp 的 ffmpeg-rockchip
+ （rkmpp/rkrga），与 rkmpp-stack 同版本构建、必须同批升级（Depends 等号锁版本）。
+ 已打 rkmpp hwdec 补丁，EGL 直接渲染 DRM PRIME 帧（mpv --hwdec=rkmpp），
+ 上限约 4K@60；10bit 片源需加 RGA 转换参数（见 rkmpp-verify 输出提示）。
+ 原生支持 X11 与 Wayland 两种会话（wayland 后端链接发行版自带 libwayland
+ >= 1.21，不打包私有副本），装完即带 /etc/mpv/mpv.conf 默认配置（conffile）。
+ 包内自带 libdisplay-info 0.1.1（/usr/local/lib）：mpv 的 drm 功能硬依赖它，
+ 而各发行版 soname 是 .so.1/.so.2/.so.3 且 Debian 12 没有此包，随包一份才通吃。
+ 与发行版源 mpv 冲突（Conflicts: mpv），防止被 apt 顶包。

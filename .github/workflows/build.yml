@@ -1,0 +1,46 @@
+name: build-rkmpp-debs
+
+on:
+  workflow_dispatch:            # 手动触发
+  schedule:
+    - cron: "0 2 * * 1"         # 每周一 02:00 UTC 追上游
+  push:
+    tags: ["v*"]                # 打 tag 时构建并发布 Release
+
+concurrency:
+  group: rkmpp-debs
+  cancel-in-progress: true
+
+permissions:
+  contents: write               # softprops/action-gh-release 需要
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm   # arm64 原生 runner（公开库免费 4 vCPU/16GB）
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 释放磁盘空间（ffmpeg 编译树很大）
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建并导出 deb（全部编译在 Debian 12 容器内完成，锁 glibc 2.36）
+        run: docker buildx build --output type=local,dest=./out .
+
+      - name: 显示产物
+        run: ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rkmpp-debs
+          path: out/*.deb
+          retention-days: 90
+
+      - name: 发布 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.deb
+          generate_release_notes: true
