@@ -143,6 +143,21 @@ FFHASH="$(git -C ffmpeg rev-parse --short HEAD)"
 echo "${FFDATE}-1" > /VERSION
 echo "ffmpeg 上游提交: $FFHASH ($FFDATE) → 包版本 $(cat /VERSION)"
 
+# 可复现构建的关键一步：编译期也要 SOURCE_DATE_EPOCH，不能只在打包阶段设。
+# 实测（run 41595714259 vs 41596349126）：两包里 rkmpp-stack 逐字节相同，唯独
+# mpv-rkmpp 不同，逐字节比对下来只有 24 字节差异 —— 20 字节 ELF build-id +
+# 4 字节来自二进制里内嵌的 __DATE__/__TIME__ 字符串（"Nov  3 2026 07:25:32" vs "07:31:05"）。
+# 内容变了，ld 算出来的 build-id 自然跟着变，所以 build-id 只是「果」不是「因」。
+# GCC 7+ / Clang 都认 SOURCE_DATE_EPOCH 来固定 __DATE__/__TIME__，钉到版本日期即可。
+# 注意：打包脚本在另一个 RUN 层里执行，环境变量不跨层，故 package-debs.sh 里也各自设了一份。
+# 这里用 python3 strptime 而不是 `date -d`：点分日期在 GNU date 上实测会返回非零。
+SOURCE_DATE_EPOCH="$(python3 -c \
+  'import sys,datetime as D; t=D.datetime.strptime(sys.argv[1].replace(".","-"),"%Y-%m-%d").replace(tzinfo=D.timezone.utc); print(int(t.timestamp()))' \
+  "$FFDATE")" || {
+  echo "FATAL: 无法从 ffmpeg 提交日期 $FFDATE 推出 SOURCE_DATE_EPOCH"; exit 1; }
+export SOURCE_DATE_EPOCH
+echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH（编译期 __DATE__/__TIME__ 随之固定）"
+
 cd ffmpeg
 ./configure --prefix="$PREFIX" --libdir="$FFMPEG_LIBDIR" \
   --enable-shared --disable-static \
