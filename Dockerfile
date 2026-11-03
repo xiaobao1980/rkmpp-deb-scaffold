@@ -68,6 +68,9 @@ ENV MPP_REF=${MPP_REF} RGA_REF=${RGA_REF} FFMPEG_REF=${FFMPEG_REF} \
 
 COPY build.sh ./
 COPY patches ./patches
+# vendor/：内置 librga(jellyfin-rga) 源码。gitee 对境外 IP 返回 401，GitHub Actions 的
+# runner 全在境外，无法 clone；国内机器却拉得通，所以这个故障只有 CI 会暴露。
+COPY vendor ./vendor
 RUN chmod +x build.sh && ./build.sh
 
 COPY packaging ./packaging

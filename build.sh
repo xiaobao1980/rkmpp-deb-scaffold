@@ -40,13 +40,22 @@ LDI_URL="${LDI_URL:-https://gitlab.freedesktop.org/emersion/libdisplay-info.git}
 # wayland-protocols：同上，只用于构建（mpv 需要 >= 1.41 的协议 XML）。
 WLP_URL="${WLP_URL:-https://gitlab.freedesktop.org/wayland/wayland-protocols.git}"
 
+# librga 源码：nyanmisaka/rga 只在 gitee，GitHub 上同名仓库已 404；而 gitee 对境外 IP
+# 返回 401（不是 404），GitHub Actions 的 runner 全在境外，clone 会报
+#   fatal: could not read Username for 'https://gitee.com'
+# 国内机器拉得通，所以实编时暴露不出这个故障——它是境外 CI 独有的坑。
+# 处置：把 jellyfin-rga@1d330cc 的源码树内置到 vendor/（7.6MB），存在则直接解压，
+# 不存在才回退 clone（国内手工构建仍可用）。详见 vendor/README.md。
+RGA_TARBALL="${RGA_TARBALL:-/src/vendor/rga-jellyfin-rga.tar.gz}"
+
 # mpv 的 rkmpp hwdec 补丁（boogie/nyanmisaka 系列，上游 mpv 未合并）。
 # 不打这个补丁，mpv 里根本没有 --hwdec=rkmpp，整个包等于白做。
 MPV_RKMPP_PATCH="${MPV_RKMPP_PATCH:-/src/patches/mpv-rkmpp-hwdec.patch}"
 
-# wayland：不再自编。基座 Debian 12 自带 wayland 1.21 + wayland-protocols 1.31，
-# 恰好满足 mpv 0.41 的下限（wayland-client/cursor >=1.21、wayland-protocols >=1.31），
-# mpv 直接链发行版库即可（早期为兼容 jammy 的 1.20 才需要自编 + 私有 rpath）。
+# wayland：libwayland-client/cursor/egl 用发行版自带的（bookworm 1.21，满足 mpv 的 >=1.21）。
+# 但 wayland-protocols 必须 >= 1.41（mpv 的 meson 写 1.31 是过时的：wayland_common.c 无条件
+# 调 wp_color_manager_v1_get_version()，该 XML 从 1.41 才进协议列表），bookworm 的 1.31 会
+# 报 implicit declaration 直接编挂，故 [6/8] 单独编 1.44——只产构建期头文件，不进包。
 
 # 兼容 branch / tag / commit-hash 的浅克隆：
 # `git clone -b` 只接受 branch/tag，传 commit hash 会直接失败。上游 ffmpeg-rockchip
@@ -105,9 +114,16 @@ cmake --install rkmpp/build
 DESTDIR="$STACK" cmake --install rkmpp/build
 
 echo "============================================================"
-echo "[2/8] librga ($RGA_REF @ gitee)"
+echo "[2/8] librga ($RGA_REF)"
 echo "============================================================"
-git_clone_ref "$RGA_URL" "$RGA_REF" rkrga
+if [ -n "$RGA_TARBALL" ] && [ -f "$RGA_TARBALL" ]; then
+  echo "[info] 用内置源码 $RGA_TARBALL（跳过 gitee：境外 IP 会被 401）"
+  rm -rf rkrga && mkdir -p rkrga
+  tar xzf "$RGA_TARBALL" -C rkrga --strip-components=1
+else
+  echo "[info] 未找到内置源码，回退从 $RGA_URL 克隆"
+  git_clone_ref "$RGA_URL" "$RGA_REF" rkrga
+fi
 meson setup rkrga/build rkrga \
   --prefix="$PREFIX" --libdir=lib \
   --buildtype=release --default-library=shared \
