@@ -20,18 +20,29 @@ mkdir -p "$OUT"
 # 因为 dpkg-deb 会把 staging 里的文件 mtime（= 构建时刻）和 ar 成员头时间写进包里，
 # 于是 xz 压缩后的字节数也跟着变（实测 9248224 vs 9253320，解包 diff 逐字节相同）。
 # 设了 SOURCE_DATE_EPOCH 后 dpkg-deb 把所有 mtime 钳到该时刻，同 pin 必出同字节。
+# 不用 `date -d "2026.10.25 00:00:00"`：这个点分日期 + 时间的写法在 bookworm 的
+# GNU date 上实测返回非零（首跑就是被这里拦下的），换成 strptime 显式 ISO 解析，无歧义。
 VER_DATE="${VER%%-*}"                                # 2026.10.25-1 → 2026.10.25
-SOURCE_DATE_EPOCH="$(date -u -d "$VER_DATE 00:00:00" +%s)" || {
-  echo "FATAL: 无法从版本号 $VER 推出 SOURCE_DATE_EPOCH（期望 <YYYY.MM.DD>-<rev>）"; exit 1; }
+read -r SOURCE_DATE_EPOCH SDE_ISO < <(python3 -c \
+  'import sys,datetime as D; d=sys.argv[1].replace(".","-"); t=D.datetime.strptime(d,"%Y-%m-%d").replace(tzinfo=D.timezone.utc); print(int(t.timestamp()), t.strftime("%Y-%m-%dT%H:%M:%SZ"))' \
+  "$VER_DATE") || true
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+  echo "FATAL: 无法从版本号 $VER 推出 SOURCE_DATE_EPOCH（期望 <YYYY.MM.DD>-<rev>）"; exit 1
+fi
 export SOURCE_DATE_EPOCH
-echo "[打包] SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH（$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ')）"
+# 变量后紧跟全角字符时必须用 ${VAR}：macOS 自带 bash 3.2 会把全角括号吞进变量名
+# （报 unbound variable），本地自测因此踩过；加花括号后两边行为一致。
+echo "[打包] SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}（${SDE_ISO:-?}）"
 
 # xz 多线程会按块切分输入，-T1 与 -T4 的输出字节数不同 → 跨机器不可复现，必须锁 1 线程。
 # --threads-max 是 dpkg 1.21.10+ 的开关，老版本没有，探测后再加，避免硬编依赖。
+# 这里不用 `dpkg-deb --help | grep -q`：命中即退会让上游吃 SIGPIPE，pipefail 下反被判失败
+# （§8 里那条坑的同一个形状），改成先落变量再匹配。
 DPKG_BUILD_OPTS=(--root-owner-group)
-if dpkg-deb --help 2>&1 | grep -q -- '--threads-max'; then
-  DPKG_BUILD_OPTS+=(--threads-max=1)
-fi
+DPKG_DEB_HELP="$(dpkg-deb --help 2>&1 || true)"
+case "$DPKG_DEB_HELP" in
+  *--threads-max*) DPKG_BUILD_OPTS+=(--threads-max=1) ;;
+esac
 
 assemble() {
   local name="$1" stage="$2"
