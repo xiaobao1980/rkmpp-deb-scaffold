@@ -13,13 +13,27 @@
 #     （wayland_common.c 无条件调 wp_color_manager_v1_get_version()，该 XML 从 1.41 才进列表）。
 #     bookworm 的 1.31 会报 implicit declaration 直接编挂，所以 build.sh [6/8] 自编 1.44，
 #     只用于构建期产头文件，不进 deb、不改 Depends。
-FROM arm64v8/debian:12 AS build
+#
+# 基础镜像按 digest 钉死（不打浮动 tag）：
+#   arm64v8/debian:12 是 OCI image index，digest 一变说明 upstream 重推了镜像，
+#   而 gcc/dpkg/xz 任一版本变化都会让产物字节跟着变。钉住后「同 commit 出同字节」
+#   才真正成立。index 内 linux/arm64 子清单 = sha256:a6db089d0e65…（2026-11-03 取）。
+#   升级方式：docker buildx imagetools inspect arm64v8/debian:12 取新 digest 后改本行。
+FROM arm64v8/debian:12@sha256:488b6b1d593bd744a457fc5ce30cea150bedb13b6072bed5046d963eb1aaba0e AS build
 ARG DEBIAN_FRONTEND=noninteractive
 
 # 上游版本 pin（可在 docker buildx build --build-arg 覆盖，详见说明书第 6 章）
-ARG MPP_REF=jellyfin-mpp
-ARG RGA_REF=jellyfin-rga
-ARG FFMPEG_REF=9.0
+#
+# 注意 mpp / rga / ffmpeg 三个上游根本**没有发布 tag**，只有长期分支
+# （jellyfin-mpp / jellyfin-rga / 9.0），分支头随时前进 → 不改本文件、不改任何代码，
+# 第二次构建就可能编出不同东西，而且日志里查不到原来编的是哪份源码。
+# 故这三个一律钉到完整 commit SHA（2026-11-03 解析自各自分支头，与当时产物同源）。
+# 想追上游就显式换 SHA，diff 里看得见；不想追就永远不动，构建结果恒等。
+ARG MPP_REF=ca9b2db9bd37f7b77f181bb3601ec71a4a41d330
+ARG RGA_REF=1d330cc28551943bed3380261a5a9c6fbd58ff53
+ARG FFMPEG_REF=e6fd228e1e2be00f9a4e1f003b287a72d252a55d
+# 下面四个是真 tag（annotated），上游不会重打；build.sh 会把解析到的 commit SHA
+# 打进日志，真要复现某个历史包时按日志里的 SHA 覆盖即可。
 ARG MPV_TAG=v0.41.0
 ARG LIBPLACEBO_TAG=v6.338.2
 # libdisplay-info：bookworm 源里没有（Debian 13 才进），而 mpv 的 drm 特性硬依赖 >=0.1.1

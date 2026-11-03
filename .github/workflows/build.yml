@@ -5,19 +5,19 @@ on:
     inputs:
       # ===== 上游版本 pin =====
       mpp_ref:
-        description: "MPP_REF（nyanmisaka/mpp 分支或 commit）"
+        description: "MPP_REF（commit SHA；上游只有 jellyfin-mpp 分支，已钉 SHA）"
         required: false
-        default: "jellyfin-mpp"
+        default: "ca9b2db9bd37f7b77f181bb3601ec71a4a41d330"
         type: string
       rga_ref:
-        description: "RGA_REF（nyanmisaka/rga 分支或 commit）"
+        description: "RGA_REF（commit SHA；CI 用 vendor 内置源码，此值作校验基准）"
         required: false
-        default: "jellyfin-rga"
+        default: "1d330cc28551943bed3380261a5a9c6fbd58ff53"
         type: string
       ffmpeg_ref:
-        description: "FFMPEG_REF（ffmpeg-rockchip 分支或 tag）"
+        description: "FFMPEG_REF（commit SHA；上游 9.0 是分支不是 tag，已钉 SHA）"
         required: false
-        default: "9.0"
+        default: "e6fd228e1e2be00f9a4e1f003b287a72d252a55d"
         type: string
       mpv_tag:
         description: "MPV_TAG（mpv tag）"
@@ -93,9 +93,9 @@ jobs:
     runs-on: ubuntu-22.04-arm   # arm64 原生 runner（公开库免费 4 vCPU/16GB）
     env:
       # 手动触发时用 inputs；tag/schedule 触发时 inputs 为空，回落到同一套默认值
-      MPP_REF: ${{ inputs.mpp_ref || 'jellyfin-mpp' }}
-      RGA_REF: ${{ inputs.rga_ref || 'jellyfin-rga' }}
-      FFMPEG_REF: ${{ inputs.ffmpeg_ref || '9.0' }}
+      MPP_REF: ${{ inputs.mpp_ref || 'ca9b2db9bd37f7b77f181bb3601ec71a4a41d330' }}
+      RGA_REF: ${{ inputs.rga_ref || '1d330cc28551943bed3380261a5a9c6fbd58ff53' }}
+      FFMPEG_REF: ${{ inputs.ffmpeg_ref || 'e6fd228e1e2be00f9a4e1f003b287a72d252a55d' }}
       MPV_TAG: ${{ inputs.mpv_tag || 'v0.41.0' }}
       LIBPLACEBO_TAG: ${{ inputs.libplacebo_tag || 'v6.338.2' }}
       LDI_TAG: ${{ inputs.ldi_tag || '0.1.1' }}

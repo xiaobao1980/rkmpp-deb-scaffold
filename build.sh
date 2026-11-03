@@ -3,9 +3,10 @@
 # 产出：/stack（rkmpp-stack 包 staging）、/mpvstage（mpv-rkmpp 包 staging）、/VERSION
 #
 # 配方基线对齐实机验证（neardi-lz200 / Armbian noble / RK35xx 6.1 vendor 内核）：
-#   mpp jellyfin-mpp@ca9b2db + rkrga jellyfin-rga + ffmpeg-rockchip 9.0(9.0.2)
+#   mpp ca9b2db9 + rkrga 1d330cc2 + ffmpeg-rockchip e6fd228e（9.0 分支）
 #   + mpv v0.41.0 + rkmpp hwdec 补丁 + libplacebo v6.338.2 + libdisplay-info 0.1.1
 #   + wayland-protocols 1.44（仅构建期，mpv 的 wayland 后端需要 >= 1.41 的协议 XML）
+# 三个没有 tag 的上游（mpp/rga/ffmpeg）默认钉 commit SHA，分支头前进不会污染产物。
 set -euo pipefail
 
 # 断言辅助：不要用 `| grep -q`。本脚本开了 pipefail，而 grep -q 命中即退出，
@@ -23,9 +24,9 @@ JOBS="$(nproc)"
 # 或用户自建的 /usr/local ffmpeg 互相顶包；只靠 rpath 暴露给本包的 ffmpeg/mpv。
 FFMPEG_LIBDIR="$PREFIX/lib/ffmpeg-rkmpp"
 
-MPP_REF="${MPP_REF:-jellyfin-mpp}"
-RGA_REF="${RGA_REF:-jellyfin-rga}"
-FFMPEG_REF="${FFMPEG_REF:-9.0}"
+MPP_REF="${MPP_REF:-ca9b2db9bd37f7b77f181bb3601ec71a4a41d330}"
+RGA_REF="${RGA_REF:-1d330cc28551943bed3380261a5a9c6fbd58ff53}"
+FFMPEG_REF="${FFMPEG_REF:-e6fd228e1e2be00f9a4e1f003b287a72d252a55d}"
 MPV_TAG="${MPV_TAG:-v0.41.0}"
 LIBPLACEBO_TAG="${LIBPLACEBO_TAG:-v6.338.2}"
 LDI_TAG="${LDI_TAG:-0.1.1}"
@@ -57,39 +58,69 @@ MPV_RKMPP_PATCH="${MPV_RKMPP_PATCH:-/src/patches/mpv-rkmpp-hwdec.patch}"
 # 调 wp_color_manager_v1_get_version()，该 XML 从 1.41 才进协议列表），bookworm 的 1.31 会
 # 报 implicit declaration 直接编挂，故 [6/8] 单独编 1.44——只产构建期头文件，不进包。
 
-# 兼容 branch / tag / commit-hash 的浅克隆：
-# `git clone -b` 只接受 branch/tag，传 commit hash 会直接失败。上游 ffmpeg-rockchip
-# 回退版本有时只能 pin commit hash，故这里兜底按 hash 浅取。
+# 兼容 branch / tag / commit-SHA 的浅取。
+#
+# 为什么要分三条路：`git clone -b` 只认 branch/tag，传 commit SHA 会直接失败；而按
+# `clone 默认分支 + fetch <sha>` 取又会把整个仓库拉下来（mpp/ffmpeg 全历史几十 MB，
+# CI 每次白等）。故先判形态：像 SHA 就走 init+fetch+specific-sha（GitHub 开了
+# uploadpack.allowAnySHA1InWant，非默认分支上的 commit 也取得到，已实测 mpp 可行）。
+#
+# 另外：mpp/rga/ffmpeg 上游根本没有 tag，只有长期分支，分支头会自己往前走。
+# 所以 Dockerfile 里这三个默认钉成完整 commit SHA —— 否则「不改代码也会编出不同字节」。
+is_sha() {
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#1}" -ge 7 ] && [ "${#1}" -le 40 ]
+}
+
 # 带 3 次重试：GitHub 偶发 `fetch-pack: invalid index-pack output`（实机日志里真出现过），
 # 一次失败就整体中断太脆。
 git_clone_ref() {
   local url="$1" ref="$2" dir="$3" recurse="${4:-}"
-  local rec_flag="" try
+  local rec_flag="" try sha
   [ "$recurse" = recursive ] && rec_flag="--recursive"
+
+  if is_sha "$ref"; then
+    for try in 1 2 3; do
+      rm -rf "$dir"; mkdir -p "$dir"
+      if git -C "$dir" init -q . &&
+         git -C "$dir" remote add origin "$url" &&
+         git -C "$dir" fetch -q --depth=1 origin "$ref" &&
+         git -C "$dir" -c advice.detachedHead=false checkout -q FETCH_HEAD &&
+         { [ "$recurse" != recursive ] || \
+           git -C "$dir" submodule update --init --recursive --depth=1 -q; }; then
+        sha="$(git -C "$dir" rev-parse HEAD)"
+        # 取到的必须就是请求的那个 SHA，否则静默给了别的东西，比报错更危险
+        [ "$sha" = "$ref" ] || {
+          echo "FATAL: $dir 取到的 HEAD=$sha ≠ 请求的 $ref"; return 1; }
+        return 0
+      fi
+      echo "[重试 $try/3] $url ($ref) 按 commit 浅取失败，5s 后重来"
+      sleep 5
+    done
+    echo "FATAL: 无法按 commit $ref 取 $url"
+    return 1
+  fi
 
   for try in 1 2 3; do
     rm -rf "$dir"
-    if git clone --depth=1 -b "$ref" $rec_flag "$url" "$dir" 2>/dev/null; then
+    if git clone -q --depth=1 -b "$ref" $rec_flag "$url" "$dir"; then
       return 0
     fi
     echo "[重试 $try/3] $url ($ref) 克隆失败，5s 后重来"
     sleep 5
   done
-
-  echo "[info] ref '$ref' 非 branch/tag，按 commit hash 浅取"
-  for try in 1 2 3; do
-    rm -rf "$dir"
-    if git clone --depth=1 $rec_flag "$url" "$dir" &&
-       git -C "$dir" fetch --depth=1 origin "$ref" &&
-       git -C "$dir" checkout "$ref"; then
-      return 0
-    fi
-    echo "[重试 $try/3] $url ($ref) 按 hash 浅取失败，5s 后重来"
-    sleep 5
-  done
-
   echo "FATAL: 无法克隆 $url ($ref)"
   return 1
+}
+
+# 记录每个上游实际落到哪个 commit。之前只记 ffmpeg 一个，其余六个编完就不知道是
+# 哪份源码——出了问题无法回溯，也无法判断两次产物差异是不是同一份输入。
+PINS=()
+pin_record() {
+  local name="$1" dir="$2" ref="$3" sha="${4:-}"
+  [ -n "$sha" ] || sha="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo unknown)"
+  printf '[pin] %-15s ref=%-42s sha=%s\n' "$name" "$ref" "$sha"
+  PINS+=("$name $sha")
 }
 
 mkdir -p "$STACK" "$MPVST"
@@ -104,6 +135,7 @@ echo "============================================================"
 echo "[1/8] MPP ($MPP_REF)"
 echo "============================================================"
 git_clone_ref "$MPP_URL" "$MPP_REF" rkmpp
+pin_record mpp rkmpp "$MPP_REF"
 cmake -S rkmpp -B rkmpp/build \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -120,9 +152,17 @@ if [ -n "$RGA_TARBALL" ] && [ -f "$RGA_TARBALL" ]; then
   echo "[info] 用内置源码 $RGA_TARBALL（跳过 gitee：境外 IP 会被 401）"
   rm -rf rkrga && mkdir -p rkrga
   tar xzf "$RGA_TARBALL" -C rkrga --strip-components=1
+  # 内置 tar 里没有 .git，rev-parse 查不到；RGA_REF 是 SHA 时它同时就是校验基准。
+  # 打包命令与来源 commit 记在 vendor/README.md。
+  if is_sha "$RGA_REF"; then
+    pin_record rga rkrga "vendor/rga-jellyfin-rga.tar.gz" "$RGA_REF"
+  else
+    pin_record rga rkrga "vendor tarball（RGA_REF 非 SHA，实际 commit 无法校验）" unknown
+  fi
 else
   echo "[info] 未找到内置源码，回退从 $RGA_URL 克隆"
   git_clone_ref "$RGA_URL" "$RGA_REF" rkrga
+  pin_record rga rkrga "$RGA_REF"
 fi
 meson setup rkrga/build rkrga \
   --prefix="$PREFIX" --libdir=lib \
@@ -138,6 +178,7 @@ echo "============================================================"
 echo "[3/8] ffmpeg-rockchip ($FFMPEG_REF → $FFMPEG_LIBDIR)"
 echo "============================================================"
 git_clone_ref "$FFMPEG_URL" "$FFMPEG_REF" ffmpeg
+pin_record ffmpeg ffmpeg "$FFMPEG_REF"
 FFDATE="$(git -C ffmpeg log -1 --format=%cd --date=format:%Y.%m.%d)"
 FFHASH="$(git -C ffmpeg rev-parse --short HEAD)"
 echo "${FFDATE}-1" > /VERSION
@@ -188,6 +229,7 @@ echo "============================================================"
 echo "[4/8] libplacebo ($LIBPLACEBO_TAG，mpv 0.41 要求 >= 6.338.2)"
 echo "============================================================"
 git_clone_ref https://github.com/haasn/libplacebo.git "$LIBPLACEBO_TAG" libplacebo recursive
+pin_record libplacebo libplacebo "$LIBPLACEBO_TAG"
 meson setup libplacebo/build libplacebo \
   --prefix="$PREFIX" --libdir=lib \
   --buildtype=release --default-library=shared \
@@ -210,6 +252,7 @@ echo "============================================================"
 # 不能退成 auto。故自编后随 mpv 包分发：顺带绕开各发行版 soname 不一致
 # （bookworm 无 / trixie .so.2 / noble .so.1 / resolute .so.3），一包通吃，无需 Depends。
 git_clone_ref "$LDI_URL" "$LDI_TAG" libdisplay-info
+pin_record libdisplay-info libdisplay-info "$LDI_TAG"
 meson setup libdisplay-info/build libdisplay-info \
   --prefix="$PREFIX" --libdir=lib \
   --buildtype=release --default-library=shared
@@ -233,6 +276,7 @@ echo "============================================================"
 #   error: implicit declaration of function 'wp_color_manager_v1_get_version'
 # 所以这里自编一份只用于构建（XML/头文件，不参与运行期，不进任何 deb，不改 Depends）。
 git_clone_ref "$WLP_URL" "$WLP_TAG" wayland-protocols
+pin_record wayland-protocols wayland-protocols "$WLP_TAG"
 meson setup wayland-protocols/build wayland-protocols \
   --prefix="$PREFIX" --libdir=lib --buildtype=release \
   -Dtests=false           # tests 要求 wayland-scanner >= 1.23，bookworm 只有 1.21
@@ -249,6 +293,16 @@ echo "============================================================"
 echo "[7/8] mpv ($MPV_TAG + rkmpp 补丁)"
 echo "============================================================"
 git_clone_ref https://github.com/mpv-player/mpv.git "$MPV_TAG" mpv
+pin_record mpv mpv "$MPV_TAG"
+
+# 汇总七个上游的实际 commit。复现历史产物时照这张表覆盖对应变量即可；
+# 排查「同 pin 不同字节」时也先看这张表——输入真的相同，才轮到怀疑构建环境。
+echo "------------------------------------------------------------"
+echo "[上游 pin 汇总]（本包源码基线，日志可直接回溯）"
+for _p in "${PINS[@]}"; do
+  printf '  %-28s %s\n' "${_p%% *}" "${_p##* }"
+done
+echo "------------------------------------------------------------"
 
 # rkmpp hwdec 补丁：给 mpv 注册 AV_HWDEVICE_TYPE_RKMPP（--hwdec=rkmpp）+ nv15/nv20 支持。
 [ -f "$MPV_RKMPP_PATCH" ] || { echo "FATAL: 找不到 mpv rkmpp 补丁 $MPV_RKMPP_PATCH"; exit 1; }
