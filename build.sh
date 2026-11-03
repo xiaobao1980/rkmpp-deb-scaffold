@@ -136,6 +136,20 @@ echo "[1/8] MPP ($MPP_REF)"
 echo "============================================================"
 git_clone_ref "$MPP_URL" "$MPP_REF" rkmpp
 pin_record mpp rkmpp "$MPP_REF"
+
+# mpp 的 CMakeLists（193–230 行）会 `git log -1 --pretty=%h…%d` 把 VCS 信息编进库里，
+# 其中 %d 是「引用装饰」：
+#   按分支取 → "(grafted, HEAD -> jellyfin-mpp, origin/jellyfin-mpp)"
+#   按 SHA 取  → "(grafted, HEAD)"
+# 同一个 commit、同一个工具链，只因为取法不同，字符串就短 38 字节 → .rodata 后移 →
+# 后面所有指令的相对偏移跟着变（实测 librockchip_mpp.so 有 50 万字节不同，且体积一样，
+# 极易被误判成「源码变了」）。故这里把 git 状态归一：detached + 清空所有 ref，
+# 让 %d 恒为 "(grafted, HEAD)"，与 pin 用 SHA/分支/tag 无关。
+# 只对 mpp 做：它是唯一实测依赖 %d 的上游（libplacebo 走 meson vcs_tag，动它风险更大）。
+git -C rkmpp checkout -q --detach HEAD
+git -C rkmpp for-each-ref --format='%(refname)' refs/heads refs/tags refs/remotes > /tmp/mpp-refs.txt
+while read -r _r; do [ -n "$_r" ] && git -C rkmpp update-ref -d "$_r"; done < /tmp/mpp-refs.txt
+echo "[mpp] 编入库内的 VCS 串: $(git -C rkmpp log -1 --pretty='%h author: %<|(30)%an %cd %s %d')"
 cmake -S rkmpp -B rkmpp/build \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DCMAKE_BUILD_TYPE=Release \
