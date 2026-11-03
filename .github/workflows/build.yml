@@ -1,7 +1,81 @@
 name: build-rkmpp-debs
 
 on:
-  workflow_dispatch:            # 手动触发
+  workflow_dispatch:            # 手动触发，可用 gh workflow run -f key=value 覆盖下面全部变量
+    inputs:
+      # ===== 上游版本 pin =====
+      mpp_ref:
+        description: "MPP_REF（nyanmisaka/mpp 分支或 commit）"
+        required: false
+        default: "jellyfin-mpp"
+        type: string
+      rga_ref:
+        description: "RGA_REF（nyanmisaka/rga 分支或 commit）"
+        required: false
+        default: "jellyfin-rga"
+        type: string
+      ffmpeg_ref:
+        description: "FFMPEG_REF（ffmpeg-rockchip 分支或 tag）"
+        required: false
+        default: "9.0"
+        type: string
+      mpv_tag:
+        description: "MPV_TAG（mpv tag）"
+        required: false
+        default: "v0.41.0"
+        type: string
+      libplacebo_tag:
+        description: "LIBPLACEBO_TAG（libplacebo tag）"
+        required: false
+        default: "v6.338.2"
+        type: string
+      ldi_tag:
+        description: "LDI_TAG（libdisplay-info tag，bookworm 无包需自编）"
+        required: false
+        default: "0.1.1"
+        type: string
+      wlp_tag:
+        description: "WLP_TAG（wayland-protocols tag，必须 >=1.41）"
+        required: false
+        default: "1.44"
+        type: string
+      # ===== 源地址（换镜像 / 国内加速用）=====
+      mpp_url:
+        description: "MPP_URL"
+        required: false
+        default: "https://github.com/nyanmisaka/mpp.git"
+        type: string
+      rga_url:
+        description: "RGA_URL（GitHub 原仓已 404，默认走 gitee；CI 有 vendor 兜底）"
+        required: false
+        default: "https://gitee.com/nyanmisaka/rga.git"
+        type: string
+      ffmpeg_url:
+        description: "FFMPEG_URL"
+        required: false
+        default: "https://github.com/nyanmisaka/ffmpeg-rockchip.git"
+        type: string
+      ldi_url:
+        description: "LDI_URL"
+        required: false
+        default: "https://gitlab.freedesktop.org/emersion/libdisplay-info.git"
+        type: string
+      wlp_url:
+        description: "WLP_URL"
+        required: false
+        default: "https://gitlab.freedesktop.org/wayland/wayland-protocols.git"
+        type: string
+      # ===== 其他 =====
+      artifact_retention:
+        description: "产物保留天数"
+        required: false
+        default: "90"
+        type: string
+      release_tag:
+        description: "非空则同时发布 Release（如 v2026.11.03）；留空只出 artifact"
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "0 2 * * 1"         # 每周一 02:00 UTC 追上游
   push:
@@ -17,8 +91,37 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04-arm   # arm64 原生 runner（公开库免费 4 vCPU/16GB）
+    env:
+      # 手动触发时用 inputs；tag/schedule 触发时 inputs 为空，回落到同一套默认值
+      MPP_REF: ${{ inputs.mpp_ref || 'jellyfin-mpp' }}
+      RGA_REF: ${{ inputs.rga_ref || 'jellyfin-rga' }}
+      FFMPEG_REF: ${{ inputs.ffmpeg_ref || '9.0' }}
+      MPV_TAG: ${{ inputs.mpv_tag || 'v0.41.0' }}
+      LIBPLACEBO_TAG: ${{ inputs.libplacebo_tag || 'v6.338.2' }}
+      LDI_TAG: ${{ inputs.ldi_tag || '0.1.1' }}
+      WLP_TAG: ${{ inputs.wlp_tag || '1.44' }}
+      MPP_URL: ${{ inputs.mpp_url || 'https://github.com/nyanmisaka/mpp.git' }}
+      RGA_URL: ${{ inputs.rga_url || 'https://gitee.com/nyanmisaka/rga.git' }}
+      FFMPEG_URL: ${{ inputs.ffmpeg_url || 'https://github.com/nyanmisaka/ffmpeg-rockchip.git' }}
+      LDI_URL: ${{ inputs.ldi_url || 'https://gitlab.freedesktop.org/emersion/libdisplay-info.git' }}
+      WLP_URL: ${{ inputs.wlp_url || 'https://gitlab.freedesktop.org/wayland/wayland-protocols.git' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: 打印本次构建参数
+        run: |
+          echo "MPP_REF=$MPP_REF"
+          echo "RGA_REF=$RGA_REF"
+          echo "FFMPEG_REF=$FFMPEG_REF"
+          echo "MPV_TAG=$MPV_TAG"
+          echo "LIBPLACEBO_TAG=$LIBPLACEBO_TAG"
+          echo "LDI_TAG=$LDI_TAG"
+          echo "WLP_TAG=$WLP_TAG"
+          echo "MPP_URL=$MPP_URL"
+          echo "RGA_URL=$RGA_URL"
+          echo "FFMPEG_URL=$FFMPEG_URL"
+          echo "LDI_URL=$LDI_URL"
+          echo "WLP_URL=$WLP_URL"
 
       - name: 释放磁盘空间（ffmpeg 编译树很大）
         run: |
@@ -27,7 +130,20 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: 构建并导出 deb（全部编译在 Debian 12 容器内完成，锁 glibc 2.36）
-        run: docker buildx build --output type=local,dest=./out .
+        run: |
+          docker buildx build --output type=local,dest=./out . \
+            --build-arg MPP_REF="$MPP_REF" \
+            --build-arg RGA_REF="$RGA_REF" \
+            --build-arg FFMPEG_REF="$FFMPEG_REF" \
+            --build-arg MPV_TAG="$MPV_TAG" \
+            --build-arg LIBPLACEBO_TAG="$LIBPLACEBO_TAG" \
+            --build-arg LDI_TAG="$LDI_TAG" \
+            --build-arg WLP_TAG="$WLP_TAG" \
+            --build-arg MPP_URL="$MPP_URL" \
+            --build-arg RGA_URL="$RGA_URL" \
+            --build-arg FFMPEG_URL="$FFMPEG_URL" \
+            --build-arg LDI_URL="$LDI_URL" \
+            --build-arg WLP_URL="$WLP_URL"
 
       - name: 显示产物
         run: ls -lh out/
@@ -36,11 +152,12 @@ jobs:
         with:
           name: rkmpp-debs
           path: out/*.deb
-          retention-days: 90
+          retention-days: ${{ inputs.artifact_retention || 90 }}
 
-      - name: 发布 Release（仅打 tag 时）
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: 发布 Release（打 tag 或手动指定 release_tag 时）
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
           files: out/*.deb
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
           generate_release_notes: true
