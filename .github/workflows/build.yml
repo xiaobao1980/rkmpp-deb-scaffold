@@ -66,6 +66,11 @@ on:
         default: "https://gitlab.freedesktop.org/wayland/wayland-protocols.git"
         type: string
       # ===== 其他 =====
+      pkg_rev:
+        description: "PKG_REV（debian revision；改打包逻辑而不改上游时递增）"
+        required: false
+        default: "2"
+        type: string
       artifact_retention:
         description: "产物保留天数"
         required: false
@@ -100,6 +105,7 @@ jobs:
       LIBPLACEBO_TAG: ${{ inputs.libplacebo_tag || 'v6.338.2' }}
       LDI_TAG: ${{ inputs.ldi_tag || '0.1.1' }}
       WLP_TAG: ${{ inputs.wlp_tag || '1.44' }}
+      PKG_REV: ${{ inputs.pkg_rev || '2' }}
       MPP_URL: ${{ inputs.mpp_url || 'https://github.com/nyanmisaka/mpp.git' }}
       RGA_URL: ${{ inputs.rga_url || 'https://gitee.com/nyanmisaka/rga.git' }}
       FFMPEG_URL: ${{ inputs.ffmpeg_url || 'https://github.com/nyanmisaka/ffmpeg-rockchip.git' }}
@@ -117,6 +123,7 @@ jobs:
           echo "LIBPLACEBO_TAG=$LIBPLACEBO_TAG"
           echo "LDI_TAG=$LDI_TAG"
           echo "WLP_TAG=$WLP_TAG"
+          echo "PKG_REV=$PKG_REV"
           echo "MPP_URL=$MPP_URL"
           echo "RGA_URL=$RGA_URL"
           echo "FFMPEG_URL=$FFMPEG_URL"
@@ -143,7 +150,8 @@ jobs:
             --build-arg RGA_URL="$RGA_URL" \
             --build-arg FFMPEG_URL="$FFMPEG_URL" \
             --build-arg LDI_URL="$LDI_URL" \
-            --build-arg WLP_URL="$WLP_URL"
+            --build-arg WLP_URL="$WLP_URL" \
+            --build-arg PKG_REV="$PKG_REV"
 
       - name: 显示产物
         run: ls -lh out/

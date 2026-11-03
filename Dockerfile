@@ -40,6 +40,9 @@ ARG LIBPLACEBO_TAG=v6.338.2
 ARG LDI_TAG=0.1.1
 # wayland-protocols：必须 >=1.41（见上方注释），1.44 是当前稳定 tag
 ARG WLP_TAG=1.44
+# debian revision：只在「源码 pin 未变、但打包逻辑变了」时递增（详见 build.sh 里的说明）。
+# 1 = 2026-11-03 之前；2 = 收掉输入侧浮点、mpp git 装饰归一之后（见说明书 §11.7/§11.8）。
+ARG PKG_REV=2
 
 # 源地址也做成 build-arg：国内构建或镜像失效时不用改 Dockerfile / build.sh，
 # 直接 --build-arg RGA_URL=... 换源即可（rga 的 GitHub 仓库已 404，只能走 gitee）。
@@ -76,7 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 ENV MPP_REF=${MPP_REF} RGA_REF=${RGA_REF} FFMPEG_REF=${FFMPEG_REF} \
     MPV_TAG=${MPV_TAG} LIBPLACEBO_TAG=${LIBPLACEBO_TAG} \
-    LDI_TAG=${LDI_TAG} WLP_TAG=${WLP_TAG} \
+    LDI_TAG=${LDI_TAG} WLP_TAG=${WLP_TAG} PKG_REV=${PKG_REV} \
     MPP_URL=${MPP_URL} RGA_URL=${RGA_URL} FFMPEG_URL=${FFMPEG_URL} \
     LDI_URL=${LDI_URL} WLP_URL=${WLP_URL}
 

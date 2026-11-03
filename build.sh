@@ -195,7 +195,14 @@ git_clone_ref "$FFMPEG_URL" "$FFMPEG_REF" ffmpeg
 pin_record ffmpeg ffmpeg "$FFMPEG_REF"
 FFDATE="$(git -C ffmpeg log -1 --format=%cd --date=format:%Y.%m.%d)"
 FFHASH="$(git -C ffmpeg rev-parse --short HEAD)"
-echo "${FFDATE}-1" > /VERSION
+# 版本号 = <ffmpeg 提交日期>-<REV>。REV 是 debian revision，专用于「同一份上游源码、
+# 打包方式变了」的场景。只在改 build.sh / package-debs.sh / Dockerfile 这类**打包逻辑**时
+# 递增；上游 pin 变了日期自然就变，不用动 REV（否则升级顺序会乱）。
+# 为什么必须有它：2026-11-03 收掉输入侧浮点时，pin 没变、源码没变，但产物字节变了
+# （mpp 的 git 装饰被归一，见说明书 §11.7）。版本号不动的话就是「同号不同字节」，
+# apt 不会认为需要升级，用户也没法靠版本号判断手里是哪份。
+REV="${PKG_REV:-1}"
+echo "${FFDATE}-${REV}" > /VERSION
 echo "ffmpeg 上游提交: $FFHASH ($FFDATE) → 包版本 $(cat /VERSION)"
 
 # 可复现构建的关键一步：编译期也要 SOURCE_DATE_EPOCH，不能只在打包阶段设。
