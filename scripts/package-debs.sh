@@ -15,6 +15,24 @@ mkdir -p "$OUT"
 [ -d "$STACK/usr/local" ] || { echo "FATAL: $STACK 为空，构建阶段未产出 staging"; exit 1; }
 [ -d "$MPVST/usr/local" ] || { echo "FATAL: $MPVST 为空，构建阶段未产出 staging"; exit 1; }
 
+# 可复现构建：把 mtime 钉死到「版本日期」（= ffmpeg 上游 commit 日）。
+# 不设的后果是实测到的：同样 pin、同样内容，两次构建出两个不同 SHA256 的 deb——
+# 因为 dpkg-deb 会把 staging 里的文件 mtime（= 构建时刻）和 ar 成员头时间写进包里，
+# 于是 xz 压缩后的字节数也跟着变（实测 9248224 vs 9253320，解包 diff 逐字节相同）。
+# 设了 SOURCE_DATE_EPOCH 后 dpkg-deb 把所有 mtime 钳到该时刻，同 pin 必出同字节。
+VER_DATE="${VER%%-*}"                                # 2026.10.25-1 → 2026.10.25
+SOURCE_DATE_EPOCH="$(date -u -d "$VER_DATE 00:00:00" +%s)" || {
+  echo "FATAL: 无法从版本号 $VER 推出 SOURCE_DATE_EPOCH（期望 <YYYY.MM.DD>-<rev>）"; exit 1; }
+export SOURCE_DATE_EPOCH
+echo "[打包] SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH（$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ')）"
+
+# xz 多线程会按块切分输入，-T1 与 -T4 的输出字节数不同 → 跨机器不可复现，必须锁 1 线程。
+# --threads-max 是 dpkg 1.21.10+ 的开关，老版本没有，探测后再加，避免硬编依赖。
+DPKG_BUILD_OPTS=(--root-owner-group)
+if dpkg-deb --help 2>&1 | grep -q -- '--threads-max'; then
+  DPKG_BUILD_OPTS+=(--threads-max=1)
+fi
+
 assemble() {
   local name="$1" stage="$2"
   local root="/tmp/debroot-$name"
@@ -39,7 +57,7 @@ assemble() {
     "$root/DEBIAN/control" > "$root/DEBIAN/control.tmp"
   mv "$root/DEBIAN/control.tmp" "$root/DEBIAN/control"
 
-  dpkg-deb --root-owner-group --build "$root" "$OUT/${name}_${VER}_arm64.deb"
+  dpkg-deb "${DPKG_BUILD_OPTS[@]}" --build "$root" "$OUT/${name}_${VER}_arm64.deb"
   echo "[打包] $OUT/${name}_${VER}_arm64.deb"
 }
 
@@ -59,6 +77,8 @@ assemble mpv-rkmpp  "$MPVST"
 echo "$VER" > "$OUT/VERSION"
 echo "============================================================"
 ls -lh "$OUT"
+echo "产物 SHA256（同 pin 重编应逐字节一致，不一致说明可复现性被破坏）："
+sha256sum "$OUT"/*.deb
 echo "版本一致性检查（两包必须同号）："
 dpkg-deb -f "$OUT/rkmpp-stack_${VER}_arm64.deb" Package Version
 dpkg-deb -f "$OUT/mpv-rkmpp_${VER}_arm64.deb"  Package Version Depends
