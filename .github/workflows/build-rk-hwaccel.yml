@@ -32,7 +32,7 @@ jobs:
         env:
           SKIP_MPP_CHECK: '1'
           # MIRROR 默认为空=直连 github/code.videolan.org；内网自建镜像时改成
-          # MIRROR: 'http://192.168.60.101:8000'
+          # MIRROR: 'http://192.0.2.10:8000'   # 内网自建镜像时填你自己的地址（RFC5737 示例地址，勿写真实内网 IP）
         run: bash hwaccel-local/build-rk-hwaccel-local.sh
 
       - name: 产物清单（tar 内含开机自适应四件套：rk-hwaccel-env / rk-hwaccel-tune /
