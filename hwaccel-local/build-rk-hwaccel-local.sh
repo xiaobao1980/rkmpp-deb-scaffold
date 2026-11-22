@@ -157,6 +157,13 @@
 #      gbm/EGL/GLESv2 + libgallium* 前缀：这几个与系统 libdrm/X11 编译期 ABI 耦合，
 #      才是真会 shadow 系统 mesa 的东西；libdrm 无符号版本、新版向后兼容，被系统
 #      gbm 引用到也不会错配。
+#  20) 板上装机预检抓到闭包漏抄：gl_scan 的"核心库跟系统走"排除式写成
+#      (libc|libm|librt|…)[^/]*\.so，前缀匹配把 libmp3lame/libmpg123/libmount/libcom_err
+#      全当成 libm/libc 家人跳过了。包内 libsndfile（mpv→libpulse→libsndfile）正好要
+#      前两个，裸 openEuler 没装 lame/mpg123 → mpv 一 ldd 就缺件。排除式改为"名字后紧跟
+#      .so 才算核心库"；老那条还有个副产物：[^/] 只有 GNU awk 认，BSD awk 直接报
+#      nonterminated character class，现在两边都能跑。install.sh 的 rpm 包名映射同步补
+#      lame/mpg123——照 SONAME 拼出来的 libmp3lame 在 openEuler 上不存在。
 #===============================================================================
 set -euo pipefail
 
@@ -798,7 +805,12 @@ if [ "$GL_BUILT" = 1 ]; then
     { LD_LIBRARY_PATH="$FB/lib:$STAGE$PREFIX/lib" ldd "$1" 2>/dev/null | awk -v pfx="$STAGE$PREFIX/" '
       NF>=4 && $2=="=>" && $3 !~ /^\/$/ && $3 !~ /^not/ {
         if ($3 ~ "^"pfx) next
-        if ($3 ~ /\/(libc|libm|libdl|libpthread|librt|libresolv|libutil|libanl|libnsl|libstdc\+\+|libgcc_s|ld-linux)[^/]*\.so/) next
+        # 只排"glibc 家族必须跟系统走"的那几个，且必须紧贴 .so：早先写成
+        # (libc|libm|librt|...)[^/]*\.so，前缀匹配把 libmp3lame/libmpg123/libmount/
+        # librtmp/libcom_err 全当成 libm/libc/librt 家人给跳过了——闭包因此缺件，
+        # 裸 openEuler 板上 mpv 一 ldd 就报缺 libmp3lame.so.0（libsndfile 的真依赖）。
+        if ($3 ~ /\/(libc|libcrypt|libm|libdl|libpthread|librt|libresolv|libutil|libanl|libnsl|libstdc\+\+|libgcc_s)\.so/) next
+        if ($3 ~ /\/ld-linux/) next
         print $3
       }'; } || true
   }
@@ -1310,6 +1322,9 @@ case "$OSID" in
     pkg() { case "$1" in
       libdrm.so.2) echo libdrm ;; libgbm.so.1) echo mesa-libgbm ;; libEGL.so.1) echo mesa-libEGL ;;
       libGL.so.1) echo mesa-libGL ;; libasound.so.2) echo alsa-lib ;; libXss.so.1) echo libXScrnSaver ;;
+      # SONAME 与包名不同名的坑（板上实测：照 ${1%%.so*} 拼出来的 libmp3lame/libmpg123
+      # 在 openEuler 上根本不存在）；认不出的用 dnf whatprovides '*/<soname>' 查
+      libmp3lame.so.0) echo lame ;; libmpg123.so.0) echo mpg123 ;;
       *) echo "${1%%.so*}" ;; esac; } ;;
 esac
 # 逐行读，不用 for x in $var（IFS 被上游脚本改过时会整串当一个词）
