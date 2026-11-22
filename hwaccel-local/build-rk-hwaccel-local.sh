@@ -78,7 +78,7 @@
 # v2.3 变更（2026-11-22，把上一条结论变成可交付能力：包内自带 GL 兜底层）：
 #   1) 新增 Step 2 libdrm 源码构建（进 /usr/local/lib）：这是纯 superset，RUNPATH 天然
 #      覆盖，让所有目标机有一个确定的 libdrm 下限；其余芯片的 KMS API 与 udev 全关。
-#   2) 新增 Step 10 mesa 兜底层（panfrost+v3d+swrast/surfaceless、GLES、Vulkan ICD）：
+#   2) 新增 Step 10 mesa 兜底层（panfrost+softpipe、GBM/EGL/GLES、Vulkan ICD）：
 #      只 DESTDIR 进 staging 的 share/rk-hwaccel/glfallback，一个字节都不进 /usr/local/lib。
 #      GBM 在 mesa 里而不在 libdrm 里（2.4.124 已确认无 gbm/ 目录），所以只能自建 mesa。
 #      prefix 就设成兜底目录本身，mesa 编译期写死的 DRI 搜索路径与 ICD json 的相对
@@ -128,6 +128,16 @@
 #  14) 配套把 GATE-GL 收紧：兜底层必须指名产出 panfrost_dri.so（mesa 换了安装库名时先
 #      链接成标准名，链接不出来直接 die）——否则"兜底只编出 swrast"等于白装，探针照旧
 #      判 GL_GPU=no，而构建期本该拦下这个问题。
+#  15) CI 实测（mpv 编到 292/298 断）挖出 mpv 0.41 的门禁不自洽：video/out/meson.build
+#      要 wayland-protocols>=1.41 才生成 color-management-v1.xml，而 wayland_common.c 的
+#      hdr_metadata_valid() 没被 #if HAVE_WAYLAND_PROTOCOLS_1_41 包住就调
+#      wp_color_manager_v1_get_version()。openEuler 24.03 是 1.33、GCC 14 又把隐式声明
+#      当错误 → 必然中断。Step 9 现在只在系统版本不足时构建期补装协议包（纯 XML+pc、
+#      不产运行库、不进产物），补不上就明确降级 -Dwayland=disabled 而不是让整包失败。
+#  16) 同理拦下 Step 10 的两处：swrast 在 mesa 24.2 里是 softpipe,llvmpipe 的别名，
+#      llvm=disabled 时 llvmpipe 是硬错误（改用 softpipe，也避免兜底层链上裸板没有的
+#      libLLVM.so）；且 mesa 24 的 gallium 只有一个 libgallium-<版本>.so，驱动名靠
+#      链接，上游只给 va/vdpau 建链接 → 构建后按 loader 要的名字自补。
 #===============================================================================
 set -euo pipefail
 
@@ -666,19 +676,26 @@ elif ! fetch_xz "mesa-$MESA_VER" "$MESA_URL"; then
   log "  [降级] mesa 源码未取到：不带 GL 兜底"
 else
   rm -rf build-mesa
-  # 选项类型/取值全部对过 mesa-24.2.8 的 meson_options.txt（这一版有 4 个坑）：
+  # 选项类型/取值全部对过 mesa-24.2.8 的 meson_options.txt 与 meson.build（这一版有 5 个坑）：
   #  * gallium-drivers 的合法值里没有 surfaceless（那是 platforms 时代的老词），只有
   #    panfrost/swrast/softpipe/llvmpipe…；写错 meson 直接 "is not in the choices" 中止。
+  #  * 别写 swrast：meson.build 169-180 行里 swrast 是 softpipe,llvmpipe 的别名，而
+  #    llvmpipe 在 LLVM 关闭时是硬错误（1851 行 "llvmpipe requires LLVM and is enabled,
+  #    but LLVM is disabled"）。退一步用 llvmpipe 也不对——它要么链系统 libLLVM.so（裸板
+  #    没有这个库，兜底层一 dlopen 就废），要么 -Dshared-llvm=disabled 要求静态 LLVM 库。
+  #    兜底层是给"系统连 GL 用户态都没有"的机器用的，自洽比软景快更重要，所以取 softpipe。
   #  * platforms 同样不接受 surfaceless/drm——但不用手填：EGL 一旦开起来 mesa 自动
   #    += surfaceless，GBM 再自动 += drm（meson.build 458-462）。这里显式给空数组，
   #    是为了躲开默认 auto 在 Linux 上选出 x11+wayland、把 X/Wayland 依赖拖进兜底层。
-  #  * llvm=disabled：软景只剩 softpipe（照编得过）；glvnd=disabled：直接产 libEGL.so.1，
-  #    免得目标机还要有 glvnd 的 vendor 派发。video-codecs 留空：只当 GPU 驱动，不抢解码活。
+  #  * glvnd=disabled：直接产 libEGL.so.1，免得目标机还要有 glvnd 的 vendor 派发。
+  #    video-codecs 留空：只当 GPU 驱动，不抢解码活。
   #  * opengl=false 必须配 glx=disabled（meson.build 430 行：不建桌面 GL 又留 glx 会报错）。
+  #  * flex/bison 是硬性依赖（meson.build 1975：needs_flex_bison = with_any_opengl or
+  #    with_gallium），已在 Step 1 的依赖清单里。
   if meson setup build-mesa "mesa-$MESA_VER" \
       --prefix="$PREFIX/$GLFALL_DIR" --libdir=lib --bindir=bin --datadir=share --includedir=include \
       --buildtype=release --default-library=shared -Db_ndebug=true -Db_lto=false \
-      -Dgallium-drivers=panfrost,swrast \
+      -Dgallium-drivers=panfrost,softpipe \
       -Dvulkan-drivers=panfrost \
       -Dplatforms= \
       -Dgbm=enabled -Degl=enabled -Dgles1=disabled -Dgles2=enabled \
@@ -689,6 +706,30 @@ else
     GL_BUILT=1
   else
     log "  [降级] mesa 构建失败：产物不带 GL 兜底（正常发行版不受影响）"
+  fi
+fi
+
+# Mesa 24 的 gallium 把各驱动都链进同一个 libgallium-<版本>.so，靠 loader 按
+# "<驱动名>_dri.so" 去开它——openEuler 自带 mesa 里 swrast_dri.so 与 kms_swrast_dri.so
+# 同 inode 就是这份证据。而我在上游源码里只查到 va/vdpau 前端调用 install_megadrivers.py，
+# 没找到给 DRI 名字建链接的地方，所以按 loader 实际会请求的名字补齐链接：兜底层若只有
+# libgallium-*.so，下面 GATE-GL 的 "缺 lib/dri/*_dri.so" 会当场 die，比到目标机上
+# 才发现强。上游哪天自己把链接建了，这里逐名判存在、自动跳过。
+if [ "$GL_BUILT" = 1 ]; then
+  DRI_DIR=$(find "$FB" -maxdepth 3 -type d -name dri 2>/dev/null | head -1)
+  GALLIUM=$(find "${DRI_DIR:-$FB}" "$FB/lib" -maxdepth 1 -name 'libgallium*.so*' -type f 2>/dev/null | head -1)
+  if [ -z "$DRI_DIR" ] || [ -z "$GALLIUM" ]; then
+    log "  [降级] 兜底层里没同时找到 dri 目录与 libgallium*.so，不补驱动名链接"
+  elif [ "$(dirname "$GALLIUM")" != "$DRI_DIR" ]; then
+    log "  [注意] libgallium 在 $(dirname "$GALLIUM")、dri 目录是 $DRI_DIR——不同目录不补名，请核对 mesa 安装布局"
+  else
+    for n in panfrost swrast kms_swrast; do
+      [ -e "$DRI_DIR/${n}_dri.so" ] && continue
+      ln -f "$GALLIUM" "$DRI_DIR/${n}_dri.so" 2>/dev/null \
+        || ln -sf "$(basename "$GALLIUM")" "$DRI_DIR/${n}_dri.so" \
+        || log "  [降级] 建不出 ${n}_dri.so"
+    done
+    log "  驱动名就位（$(basename "$GALLIUM") 的链接）：$(cd "$DRI_DIR" && ls | tr '\n' ' ')"
   fi
 fi
 
@@ -857,16 +898,24 @@ case "$GPU_DRV" in
   *)                GL_NAMES="panfrost panthor lima" ;;   # 内核证据缺失时按常见开源驱动名找
 esac
 GL_HIT=""
-dri_has_gpu_driver() {   # $1=候选 dri 目录（空格分隔）；命中则把驱动名放进 GL_HIT
+dri_has_gpu_driver() {   # $1=候选 dri 目录（空格分隔） $2=trust 时只认驱动名（包内兜底层用）
   local d n t i swi=""
-  for d in $1; do
-    t=$(readlink -f "$d/swrast_dri.so" 2>/dev/null)   # 必须解引用：符号链接自身 inode 无意义
-    [ -n "$t" ] && [ -f "$t" ] && { swi=$(stat -c %i "$t" 2>/dev/null); break; }
-  done
+  if [ "${2:-}" != trust ]; then
+    for d in $1; do
+      t=$(readlink -f "$d/swrast_dri.so" 2>/dev/null)   # 必须解引用：符号链接自身 inode 无意义
+      [ -n "$t" ] && [ -f "$t" ] && { swi=$(stat -c %i "$t" 2>/dev/null); break; }
+    done
+  fi
   for d in $1; do
     for n in $GL_NAMES; do
       t=$(readlink -f "$d/${n}_dri.so" 2>/dev/null)
       [ -n "$t" ] && [ -f "$t" ] || continue
+      # 兜底层是 mesa 24 的 megadrivers 形态：panfrost/swrast/kms_swrast 三个名字本来就
+      # 是同一个 libgallium-<版本>.so 的链接，比 inode 会把自己编出来的兜底判成"没有 GPU
+      # 驱动"。这个名字由 Step 10 的 -Dgallium-drivers=panfrost 真编出来（GATE-GL 指名
+      # 校验过，缺了直接 die），所以这里认名字就是认构建事实。系统目录仍要防发行版的
+      # 硬链接别名（openEuler 把 swrast 链成 rockchip_dri.so 那类），保持原判定。
+      [ "${2:-}" = trust ] && { GL_HIT=$n; return 0; }
       i=$(stat -c %i "$t" 2>/dev/null)
       { [ -z "$i" ] || [ "$i" != "$swi" ]; } && { GL_HIT=$n; return 0; }
     done
@@ -876,7 +925,7 @@ dri_has_gpu_driver() {   # $1=候选 dri 目录（空格分隔）；命中则把
 GL_GPU=no; GL_DRIVER=none; GL_SRC=none; GL_WHY=""
 if [ "$GBM" = yes ] && dri_has_gpu_driver "$SYS_DRIDIR"; then
   GL_SRC=system; GL_GPU=yes; GL_DRIVER=$GL_HIT
-elif [ "$GLFALL" = yes ] && dri_has_gpu_driver "$GLFALL_DIR/lib/dri"; then
+elif [ "$GLFALL" = yes ] && dri_has_gpu_driver "$GLFALL_DIR/lib/dri" trust; then
   GL_SRC=bundle; GL_GPU=yes; GL_DRIVER=$GL_HIT; GBM=yes   # 下游按"有 GBM"处理，出处由 GL_SRC 说明
   GL_LIBDIR="$GLFALL_DIR/lib"
   GL_DRIDIR="$GLFALL_DIR/lib/dri"
