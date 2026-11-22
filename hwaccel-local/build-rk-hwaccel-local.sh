@@ -172,6 +172,13 @@
 #         连 --help 都加载失败，于是报"0 个解码器 / 0 项 hwdec / 未解析依赖 9"——全是假
 #         阴性（手工带 $GLF 复查是 10 解码器、3 rkrga、20 hwdec、ldd 零缺件）。探针在
 #         v2.3 第 4 条已改过，验证段漏了 → 统一走 VLD（含 $GLF）。
+#  22) 板上跑分日志里每次启动都打三行伪报错（"Option gpu-context: 'displayvk' isn't
+#      supported / Error parsing option / mpv.conf:28: setting option failed"）：档位
+#      菜单第 12.d 条只做了"标注原因"，值本身照样发出去。放在 [profile] 段里不致命
+#      （档没选中不影响播放，本轮 8K 空白行另有原因，见 23），但选中就是黑屏，且日志
+#      不该有假错误 → 本机用不了的 gpu-context 值改为注释行，说明"换板子重生成时自动
+#      放开"（本文件每次开机/热插拔重生成，Valhall 板自然拿到可用值）。x11egl/wayland
+#      同闸：按 CTX_X11/CTX_WL 判定，本 mpv 没编的上下文不再裸发。
 #===============================================================================
 set -euo pipefail
 
@@ -1877,6 +1884,18 @@ tmp=$(mktemp)
   # openEuler 裸 mesa 只有 kms_swrast，选中这条会静默变成 CPU 光栅。旧探针没这键时退回 GBM。
   n_gl="";   { [ "${GPU:-no}" != yes ] || [ "${GL_GPU:-${GBM:-no}}" != yes ]; } && n_gl="无可用 GLES 驱动（${GL_WHY:-系统无 GBM/EGL 用户态}），vo=drm 只能 CPU 拷帧"
   n_gpu="";  { [ "${CTX_DSVK:-no}" != yes ] || [ "${VK_OK:-no}" != yes ]; } && n_gpu="${VK_WHY:-本 mpv 没编 displayvk}"
+  # 档位菜单里的 gpu-context 值必须是"本机真能用"的，否则只写成注释：
+  # 板上实测（RK3576 + 本包 mpv）mpv.conf 里 [rk-drm-gpu] 段的 gpu-context=displayvk
+  # 每次启动都打三行 "Option gpu-context: 'displayvk' isn't supported / Error parsing
+  # option gpu-context / mpv.conf:28: setting option ... failed"。profile 段里它不致命
+  # （档没选中时不影响播放），但选中就是黑屏，而且没人该在日志里看到伪报错。
+  # 本文件每次开机/热插拔重生成，所以本机不可用时先注释掉、换到能用的板子自动展开。
+  L_DSVK='gpu-context=displayvk'
+  [ -n "$n_gpu" ] && L_DSVK="# gpu-context=displayvk   ← 本机不可用（见上一行说明），故注释；换板子重生成时自动放开"
+  L_X11='gpu-context=x11egl'
+  [ "${CTX_X11:-yes}" = no ] && L_X11="# gpu-context=x11egl   ← 本 mpv 没编 x11 上下文"
+  L_WL='gpu-context=wayland'
+  [ "${CTX_WL:-yes}" = no ] && L_WL="# gpu-context=wayland   ← 本 mpv 没编 wayland 上下文"
   n_x11="";  n_wl=""
   { [ "${GPU:-no}" != yes ] || [ "${GBM:-no}" != yes ]; } && { n_x11="无 GPU/GBM，这条会退回软解"; n_wl="$n_x11"; }
   printf '%s\n' \
@@ -1888,12 +1907,12 @@ tmp=$(mktemp)
     '[rk-drm-gl]' 'vo=drm' 'hwdec=rkmpp-copy' '' \
     "# gpu-context=displayvk 只给 vo=gpu/gpu-next，且要 Valhall 及以后的 Mali（PanVK 覆盖）" \
     "${n_gpu:+# rk-drm-gpu 本机不可用：$n_gpu}" \
-    '[rk-drm-gpu]' 'vo=gpu-next' 'gpu-context=displayvk' 'hwdec=rkmpp' '' \
+    '[rk-drm-gpu]' 'vo=gpu-next' "$L_DSVK" 'hwdec=rkmpp' '' \
     "${n_x11:+# rk-x11-gpu 本机不可用：$n_x11}" \
-    '[rk-x11-gpu]' 'vo=gpu-next' 'gpu-context=x11egl' 'hwdec=rkmpp' '' \
+    '[rk-x11-gpu]' 'vo=gpu-next' "$L_X11" 'hwdec=rkmpp' '' \
     '[rk-x11-sw]' 'vo=xv' '' \
     "${n_wl:+# rk-wayland-gpu 本机不可用：$n_wl}" \
-    '[rk-wayland-gpu]' 'vo=gpu-next' 'gpu-context=wayland' 'hwdec=rkmpp' '' \
+    '[rk-wayland-gpu]' 'vo=gpu-next' "$L_WL" 'hwdec=rkmpp' '' \
     '[rk-wayland-sw]' 'vo=wlshm'
 } > "$tmp"
 if [ "$DRY" = 1 ]; then
