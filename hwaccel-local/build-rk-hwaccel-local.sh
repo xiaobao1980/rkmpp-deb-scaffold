@@ -226,6 +226,14 @@ fetch_xz() {  # $1=目标目录 $2=下载 URL；已存在则跳过
   return 0
 }
 
+# 源码包地址：给了 MIRROR 就按"镜像根/文件名"拼，没给就用官方 URL。
+# 不要再写 "${MIRROR:+$MIRROR/}dav1d-1.5.4.tar.gz" 那种拼接：MIRROR 为空时它产出的
+# 是一个【非空】的相对名，后面 ${VAR:-官方URL} 的兜底永远不触发，curl 便把文件名当
+# 主机名解析——CI 上 Step 5 就是死在 "Could not resolve host: dav1d-1.5.4.tar.gz"。
+src_url() {  # $1=镜像内的文件名 $2=官方 URL
+  if [ -n "$MIRROR" ]; then printf '%s/%s' "${MIRROR%/}" "$1"; else printf '%s' "$2"; fi
+}
+
 # meson 版本门禁：mpv 0.41 要求 meson>=1.3.0，openEuler/Debian 老仓库可能不满足
 ensure_meson() {
   local need="$1" have
@@ -365,10 +373,12 @@ log "  librga $(pkg-config --modversion librga)"
 log "Step 5/11 编译 dav1d ($DAV1D_VER)"
 cd "$WORK"
 [ -d "dav1d-$DAV1D_VER" ] || {
-  DAV1D_URL="${MIRROR:+$MIRROR/}dav1d-$DAV1D_VER.tar.gz"
-  DAV1D_URL="${DAV1D_URL:-https://code.videolan.org/videolan/dav1d/-/archive/$DAV1D_VER/dav1d-$DAV1D_VER.tar.gz}"
+  DAV1D_URL=$(src_url "dav1d-$DAV1D_VER.tar.gz" \
+    "https://code.videolan.org/videolan/dav1d/-/archive/$DAV1D_VER/dav1d-$DAV1D_VER.tar.gz")
   curl -fSL "$DAV1D_URL" -o "/tmp/dav1d-$DAV1D_VER.tar.gz" || die "dav1d 源码拉取失败：$DAV1D_URL"
   tar xf "/tmp/dav1d-$DAV1D_VER.tar.gz"
+  # gitlab archive 顶层目录就是 dav1d-<tag>
+  [ -d "dav1d-$DAV1D_VER" ] || die "dav1d 解包后没有 dav1d-$DAV1D_VER 目录（检查 tar 顶层名）"
 }
 rm -rf build-dav1d
 meson setup build-dav1d "dav1d-$DAV1D_VER" \
@@ -381,12 +391,18 @@ do_install ninja -C build-dav1d install
 log "Step 6/11 编译 libdisplay-info ($LIBDISPLAY_INFO_VER)"
 cd "$WORK"
 [ -d "libdisplay-info-$LIBDISPLAY_INFO_VER" ] || {
-  LDI_URL="${MIRROR:+$MIRROR/}libdisplay-info-$LIBDISPLAY_INFO_VER.tar.xz"
-  LDI_URL="${LDI_URL:-https://gitlab.freedesktop.org/emersion/libdisplay-info/-/releases/$LIBDISPLAY_INFO_VER/downloads/$LIBDISPLAY_INFO_VER.tar.xz}"
-  LDI_URL="${LDI_URL%.tar.xz}.tar.xz"
-  curl -fSL "$LDI_URL" -o "/tmp/libdisplay-info.tar.xz" \
-    || { git -C "$WORK" clone --depth 1 --branch "$LIBDISPLAY_INFO_VER" https://gitlab.freedesktop.org/emersion/libdisplay-info.git "libdisplay-info-$LIBDISPLAY_INFO_VER"; }
-  [ -d "libdisplay-info-$LIBDISPLAY_INFO_VER" ] || { mkdir -p "libdisplay-info-$LIBDISPLAY_INFO_VER"; tar xf /tmp/libdisplay-info.tar.xz -C "libdisplay-info-$LIBDISPLAY_INFO_VER" --strip-components=1; }
+  # 发布资产名是 libdisplay-info-<ver>.tar.xz（不是 <ver>.tar.xz），镜像里同名
+  LDI_URL=$(src_url "libdisplay-info-$LIBDISPLAY_INFO_VER.tar.xz" \
+    "https://gitlab.freedesktop.org/emersion/libdisplay-info/-/releases/$LIBDISPLAY_INFO_VER/downloads/libdisplay-info-$LIBDISPLAY_INFO_VER.tar.xz")
+  if curl -fSL "$LDI_URL" -o "/tmp/libdisplay-info.tar.xz"; then
+    mkdir -p "libdisplay-info-$LIBDISPLAY_INFO_VER"
+    tar xf /tmp/libdisplay-info.tar.xz -C "libdisplay-info-$LIBDISPLAY_INFO_VER" --strip-components=1
+  else
+    log "  发布包拉取失败（$LDI_URL），回落 git clone tag $LIBDISPLAY_INFO_VER"
+    git -C "$WORK" clone --depth 1 --branch "$LIBDISPLAY_INFO_VER" \
+      https://gitlab.freedesktop.org/emersion/libdisplay-info.git "libdisplay-info-$LIBDISPLAY_INFO_VER"
+  fi
+  [ -d "libdisplay-info-$LIBDISPLAY_INFO_VER" ] || die "libdisplay-info 源码未就位：tar 与 git 两条路都不通"
 }
 rm -rf build-libdisplay-info
 meson setup build-libdisplay-info "libdisplay-info-$LIBDISPLAY_INFO_VER" \
@@ -398,12 +414,13 @@ do_install ninja -C build-libdisplay-info install
 log "Step 7/11 编译 libplacebo ($LIBPLACEBO_VER)"
 cd "$WORK"
 [ -d "libplacebo-$LIBPLACEBO_VER" ] || {
-  LP_URL="${MIRROR:+$MIRROR/}libplacebo-$LIBPLACEBO_VER.tar.gz"
-  LP_URL="${LP_URL:-https://code.videolan.org/videolan/libplacebo/-/archive/v$LIBPLACEBO_VER/libplacebo-v$LIBPLACEBO_VER.tar.gz}"
+  LP_URL=$(src_url "libplacebo-v$LIBPLACEBO_VER.tar.gz" \
+    "https://code.videolan.org/videolan/libplacebo/-/archive/v$LIBPLACEBO_VER/libplacebo-v$LIBPLACEBO_VER.tar.gz")
   curl -fSL "$LP_URL" -o "/tmp/libplacebo.tar.gz" || die "libplacebo 源码拉取失败：$LP_URL"
   tar xf /tmp/libplacebo.tar.gz
   # videolan archive 顶层目录带 v 前缀，统一成无 v 的目录名
   [ -d "libplacebo-$LIBPLACEBO_VER" ] || mv -f "libplacebo-v$LIBPLACEBO_VER" "libplacebo-$LIBPLACEBO_VER"
+  [ -d "libplacebo-$LIBPLACEBO_VER" ] || die "libplacebo 解包后目录名不对（顶层应为 libplacebo-v$LIBPLACEBO_VER）"
 }
 rm -rf build-libplacebo
 # vulkan 默认关：省掉 glslang/shaderc 全链，代价是 mpv 没有 displayvk 上下文。
