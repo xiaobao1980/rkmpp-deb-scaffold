@@ -306,6 +306,9 @@ done
 # 装进 $PREFIX/lib：mpp/ffmpeg/mpv 的 RUNPATH 天然覆盖它，是所有目标机的下限保证。
 # 关掉其余芯片的 KMS API 与 udev——RK3576 的 panfrost 只用 libdrm 核心 + panfrost uapi
 # 头，多余驱动只增大 shadow 面。GBM 不在 libdrm 里（2.4.124 无 gbm/ 目录），由 Step 10 出。
+# 选项类型别混：udev/tests/install-test-programs 在 meson_options.txt 里是 boolean，只能
+# 写 =true/=false；芯片 KMS API 与 cairo-tests/man-pages/valgrind 是 feature，才用 disabled。
+# 写错直接 "value disabled is not boolean" 中止，CI 上就是这一步第一次踩到的原因。
 log "Step 2/11 编译 libdrm ($LIBDRM_VER)"
 cd "$WORK"
 if fetch_xz "libdrm-$LIBDRM_VER" "$LIBDRM_URL"; then
@@ -316,7 +319,7 @@ if fetch_xz "libdrm-$LIBDRM_VER" "$LIBDRM_URL"; then
     -Dvmwgfx=disabled -Domap=disabled -Dexynos=disabled -Dfreedreno=disabled \
     -Dtegra=disabled -Dvc4=disabled -Detnaviv=disabled \
     -Dcairo-tests=disabled -Dman-pages=disabled -Dvalgrind=disabled \
-    -Dudev=disabled -Dtests=disabled -Dinstall-test-programs=disabled \
+    -Dudev=false -Dtests=false -Dinstall-test-programs=false \
     || die "libdrm meson setup 失败（选项名随版本变动，核对 $WORK/libdrm-$LIBDRM_VER/meson_options.txt）"
   ninja -C build-libdrm && do_install ninja -C build-libdrm install
   pkg-config --exists libdrm || die "pkg-config 找不到 libdrm——libdrm.pc 未生成"
@@ -408,11 +411,13 @@ rm -rf build-libplacebo
 # Valhall+ 板上有意义，需要时 PLACEBO_VULKAN=1 重建。
 # opengl=enabled 显式要求 EGL/GL 后端（gpu-next 在本硬件上走的就是它），
 # 缺了就构建失败而不是静默降级
+# 6.338.2 的 meson_options.txt 里没有 vkd3d（旧 4.x 才有），多写的 -D 一律算
+# "Unknown options" 直接中止 setup；demos/tests 是 boolean 只能 true/false。
 VKOPT=disabled; [ "$PLACEBO_VULKAN" = 1 ] && VKOPT=enabled
 meson setup build-libplacebo "libplacebo-$LIBPLACEBO_VER" \
   --prefix="$PREFIX" --libdir=lib --buildtype=release \
-  -Dvulkan="$VKOPT" -Dopengl=enabled -Ddemos=false -Dtests=false \
-  -Dd3d11=disabled -Dvkd3d=disabled
+  -Dvulkan="$VKOPT" -Dopengl=enabled -Dd3d11=disabled \
+  -Ddemos=false -Dtests=false
 ninja -C build-libplacebo
 do_install ninja -C build-libplacebo install
 pkg-config --exists libplacebo || die "libplacebo.pc 未生成"
@@ -454,13 +459,15 @@ log "Step 9/11 编译 mpv ($MPV_TAG，三显示后端 + alsa + gpu-next)"
 cd "$WORK"
 fetch_src mpv mpv.tar.gz "$MPV_TAG" "$MPV_REPO"
 rm -rf build-mpv
-# RUNPATH 两目录都给：libav*/librockchip_mpp/librga/libdav1d 在 lib，libmpv/libplacebo
+# RUNPATH 两目录都给：libav*/librockchip_mpp/librga/dav1d 在 lib，libmpv/libplacebo
 # 由各自 meson 决定，openEuler 上常见 lib64 —— 只写一个会漏
+# 0.41 的 meson.options 已无 libplacebo 选项（它变成硬依赖），再传 -Dlibplacebo 会
+# 被判成 "Unknown options" 而中止，所以这里只给显示后端与音频开关。
 meson setup build-mpv mpv \
   --prefix="$PREFIX" --libdir=lib --buildtype=release \
   -Dcdda=disabled -Ddvdnav=disabled -Dlibbluray=disabled \
   -Ddrm=enabled -Dgbm=enabled -Dwayland=enabled -Dx11=enabled \
-  -Dalsa=enabled -Dlibplacebo=enabled \
+  -Dalsa=enabled \
   -Dc_link_args="-Wl,-rpath,$PREFIX/lib:$PREFIX/lib64"
 ninja -C build-mpv
 do_install ninja -C build-mpv install
@@ -488,7 +495,7 @@ run_mpv --ao=help 2>&1 | grep -Eq '(^|[[:space:]])alsa([[:space:]]|$)' \
 VOS=$(run_mpv --vo=help 2>/dev/null)
 # vo=drm 是 tty 直出的主力档：它自带 GBM/EGL 上下文（只需 GLES），不依赖 gpu-context。
 # 缺了它无桌面机型就没有任何 GPU 直出路径，所以硬失败（-Ddrm/-Dgbm 见上）
-printf '%s\n' "$VOS" | grep -qw gpu-next || die "mpv 无 gpu-next VO——检查 libplacebo 与 -Dlibplacebo=enabled"
+printf '%s\n' "$VOS" | grep -qw gpu-next || die "mpv 无 gpu-next VO——0.41 把 libplacebo 设成硬依赖（没有 -Dlibplacebo 开关了），检查 Step 7 是否装成功、pkg-config 能否找到 libplacebo"
 printf '%s\n' "$VOS" | grep -qw drm || die "mpv 无 drm VO——检查 -Ddrm=enabled 与 libdrm/gbm/egl 开发包"
 # 注意：mpv 0.41 的 --gpu-context 里【没有 drm】（RK3576 板上实测传 drm 是致命解析错误），
 # 但这不影响 vo=drm——gpu-context 只约束 vo=gpu/gpu-next，vo=drm 走自己的 EGL/GBM 路径。
@@ -533,14 +540,21 @@ elif ! fetch_xz "mesa-$MESA_VER" "$MESA_URL"; then
   log "  [降级] mesa 源码未取到：不带 GL 兜底"
 else
   rm -rf build-mesa
-  # llvm=disabled：软景只留 softpipe（无 LLVM 也编得过）；glvnd=disabled：直接产 libEGL.so.1，
-  # 免得目标机还要有 glvnd 的 vendor 派发。video-codecs 留空：只当 GPU 驱动，不抢纯视频解码活。
+  # 选项类型/取值全部对过 mesa-24.2.8 的 meson_options.txt（这一版有 4 个坑）：
+  #  * gallium-drivers 的合法值里没有 surfaceless（那是 platforms 时代的老词），只有
+  #    panfrost/swrast/softpipe/llvmpipe…；写错 meson 直接 "is not in the choices" 中止。
+  #  * platforms 同样不接受 surfaceless/drm——但不用手填：EGL 一旦开起来 mesa 自动
+  #    += surfaceless，GBM 再自动 += drm（meson.build 458-462）。这里显式给空数组，
+  #    是为了躲开默认 auto 在 Linux 上选出 x11+wayland、把 X/Wayland 依赖拖进兜底层。
+  #  * llvm=disabled：软景只剩 softpipe（照编得过）；glvnd=disabled：直接产 libEGL.so.1，
+  #    免得目标机还要有 glvnd 的 vendor 派发。video-codecs 留空：只当 GPU 驱动，不抢解码活。
+  #  * opengl=false 必须配 glx=disabled（meson.build 430 行：不建桌面 GL 又留 glx 会报错）。
   if meson setup build-mesa "mesa-$MESA_VER" \
       --prefix="$PREFIX/$GLFALL_DIR" --libdir=lib --bindir=bin --datadir=share --includedir=include \
       --buildtype=release --default-library=shared -Db_ndebug=true -Db_lto=false \
-      -Dgallium-drivers=panfrost,surfaceless,swrast \
+      -Dgallium-drivers=panfrost,swrast \
       -Dvulkan-drivers=panfrost \
-      -Dplatforms=surfaceless,drm \
+      -Dplatforms= \
       -Dgbm=enabled -Degl=enabled -Dgles1=disabled -Dgles2=enabled \
       -Dopengl=false -Dglx=disabled -Dglvnd=disabled -Dllvm=disabled \
       -Dxmlconfig=disabled -Dbuild-tests=false -Dvideo-codecs= \
@@ -581,7 +595,7 @@ if [ "$GL_BUILT" = 1 ]; then
 
   gate "GATE-GL：兜底层自洽性"
   for need in lib/libgbm.so.1 lib/libEGL.so.1 lib/libGLESv2.so.2; do
-    [ -e "$FB/$need" ] || die "GL 兜底缺 $need（mesa 选项/平台没编出来，检查 -Dplatforms/-Dgles2）"
+    [ -e "$FB/$need" ] || die "GL 兜底缺 $need（mesa 选项没编出来：libgbm 看 -Dgbm，EGL/GLES 看 -Degl/-Dgles2；platforms 留空即可，EGL 一开 mesa 自动补 surfaceless、GBM 再补 drm）"
   done
   ls "$FB"/lib/dri/*dri.so >/dev/null 2>&1 || die "GL 兜底缺 lib/dri/*_dri.so：无 GBM 后端可用的驱动"
   # 兜底层的存在意义就是"系统 mesa 给不出 Mali 驱动"（openEuler 裸 mesa 只有 swrast），
