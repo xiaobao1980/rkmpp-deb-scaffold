@@ -131,13 +131,18 @@
 #  15) CI 实测（mpv 编到 292/298 断）挖出 mpv 0.41 的门禁不自洽：video/out/meson.build
 #      要 wayland-protocols>=1.41 才生成 color-management-v1.xml，而 wayland_common.c 的
 #      hdr_metadata_valid() 没被 #if HAVE_WAYLAND_PROTOCOLS_1_41 包住就调
-#      wp_color_manager_v1_get_version()。openEuler 24.03 是 1.33、GCC 14 又把隐式声明
-#      当错误 → 必然中断。Step 9 现在只在系统版本不足时构建期补装协议包（纯 XML+pc、
+#      wp_color_manager_v1_get_version()。openEuler 24.03 只有 1.33，而 mpv 自己带
+#      -Werror=implicit-function-declaration（CI 实测 GCC 12.3.1 也炸）→ 必然中断。
+#      Step 9 现在只在系统版本不足时构建期补装协议包（纯 XML+pc、
 #      不产运行库、不进产物），补不上就明确降级 -Dwayland=disabled 而不是让整包失败。
 #  16) 同理拦下 Step 10 的两处：swrast 在 mesa 24.2 里是 softpipe,llvmpipe 的别名，
 #      llvm=disabled 时 llvmpipe 是硬错误（改用 softpipe，也避免兜底层链上裸板没有的
 #      libLLVM.so）；且 mesa 24 的 gallium 只有一个 libgallium-<版本>.so，驱动名靠
 #      链接，上游只给 va/vdpau 建链接 → 构建后按 loader 要的名字自补。
+#  17) CI 实测 Step 10 还差 PyYAML（mesa meson.build:967 是硬 error，不是可选依赖）：
+#      补装按 openEuler 的包名 python3-pyyaml 走，候选名逐个试并逐个回验 import，
+#      全都不上才降级为"不带兜底层"。同时修掉 Step 11 自检的误判——它拿固定路径
+#      ^#!/bin/bash 比对，而内嵌脚本一律是 #!/usr/bin/env bash，任何构建都会 die。
 #===============================================================================
 set -euo pipefail
 
@@ -251,6 +256,20 @@ src_url() {  # $1=镜像内的文件名 $2=官方 URL
 
 # 版本号比较：ver_ge 实际 最低要求 —— 缺包时传 "0"，恒小于任何真实版本
 ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
+
+# Python 模块探针：mesa 的 meson setup 对 mako/yaml 是硬 error（见 Step 10），先探再装
+py_mod() { python3 -c "import $1" 2>/dev/null; }
+# py_mod_install import名 pip名 [dnf包名...]：各家发行版的 python3-* 包名大小写不统一，
+# 逐个试；dnf 装完必须再 import 一次确认（包在但模块名不同也算失败），最后才退 pip3
+py_mod_install() {
+  local imp=$1 pip=$2 p
+  shift 2
+  py_mod "$imp" && return 0
+  for p in "$@"; do
+    dnf install -y "$p" >/dev/null 2>&1 && py_mod "$imp" && return 0
+  done
+  pip3 install --quiet "$pip" >/dev/null 2>&1 && py_mod "$imp"
+}
 
 # meson 版本门禁：mpv 0.41 要求 meson>=1.3.0，openEuler/Debian 老仓库可能不满足
 ensure_meson() {
@@ -662,16 +681,19 @@ GL_BUILT=0
 GL_NOTE="（未附带：目标机需自备 libdrm/mesa/libass）"
 if [ "$GLBUNDLE" = "1" ]; then
   # mesa 的代码生成器与 XML 依赖：装不上就降级为"不带兜底"，不拖垮整包构建
-  python3 -c 'import mako' 2>/dev/null \
-    || dnf install -y python3-mako >/dev/null 2>&1 \
-    || dnf install -y python3-Mako >/dev/null 2>&1 \
-    || pip3 install --quiet mako >/dev/null 2>&1 || true
+  py_mod_install mako Mako python3-mako python3-Mako || true
+  # PyYAML 是 mesa meson.build:967 的硬 error（"Python (3.x) yaml module (PyYAML) required
+  # to build mesa"），openEuler 的包名是 python3-pyyaml；这一条 CI 实测会卡在 setup 阶段
+  py_mod_install yaml PyYAML python3-pyyaml python3-PyYAML python3-yaml || true
   dnf install -y expat-devel >/dev/null 2>&1 || true
+  # 两个模块少任何一个都会在 meson setup 阶段中止，与其等它报错不如先查齐
+  MESA_PY_MISS=""
+  for _m in mako yaml; do py_mod "$_m" || MESA_PY_MISS="$MESA_PY_MISS $_m"; done
 fi
 if [ "$GLBUNDLE" != "1" ]; then
   log "  [跳过] GLBUNDLE=0：产物不含 GL 兜底（目标机需自备 libdrm/mesa/libass）"
-elif ! python3 -c 'import mako' 2>/dev/null; then
-  log "  [降级] 构建机缺 python3 mako（mesa 的代码生成器）：不带 GL 兜底"
+elif [ "${MESA_PY_MISS:-}" != "" ]; then
+  log "  [降级] 构建机缺 python3 模块$MESA_PY_MISS（mesa 的代码生成器）：不带 GL 兜底"
 elif ! fetch_xz "mesa-$MESA_VER" "$MESA_URL"; then
   log "  [降级] mesa 源码未取到：不带 GL 兜底"
 else
@@ -1892,8 +1914,10 @@ for sc in "$STAGE/install.sh" "$STAGE$PREFIX/bin/rk-hwaccel-env" \
           "$STAGE$PREFIX/bin/rk-hwaccel-tune" "$STAGE$PREFIX/bin/mpv-auto"; do
   bash -n "$sc" || die "生成的脚本语法错误：$sc"
 done
+# 三个探针脚本走 bash 语法（数组、[[ ]]），但 shebang 是发行版无关的
+# "#!/usr/bin/env bash"——这里只认"首行是 shebang 且指向 bash"，别按固定路径比对
 for sc in "$STAGE$PREFIX/bin/rk-hwaccel-env" "$STAGE$PREFIX/bin/rk-hwaccel-tune" "$STAGE$PREFIX/bin/mpv-auto"; do
-  head -1 "$sc" | grep -q '^#!/bin/bash' || die "$sc 缺 shebang"
+  head -1 "$sc" | grep -q '^#!.*bash' || die "$sc 缺 bash shebang"
 done
 
 # 瘦身：目标机运行不需要头文件/静态库/libtool 文件与测试程序
