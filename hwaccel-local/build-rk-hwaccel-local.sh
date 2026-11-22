@@ -151,6 +151,12 @@
 #      ldd 撞非 ELF 返回 1，这个 1 顺着 while 循环体传到外层管道，整包构建连 GATE-GL
 #      都没跑到就死了（第三轮其实是同一个坑，被上面临近的自补失败掩盖了）。
 #      改为只扫 *.so* 且让 gl_scan 显式吞掉非 0；cp 失败也只记降级不 die。
+#  19) CI 第五轮 Step 10 全绿（兜底层 84 个 .so / 78M 入包）后死在收尾毒判：名单里放了
+#      libdrm.so.2，而 Step 2 恰恰用 die 强制它进 $PREFIX/lib（mpv 直接链接、RUNPATH
+#      指向这里），两条门禁互斥，任何带 GL 兜底的构建都必死。名单收窄为 mesa 自家的
+#      gbm/EGL/GLESv2 + libgallium* 前缀：这几个与系统 libdrm/X11 编译期 ABI 耦合，
+#      才是真会 shadow 系统 mesa 的东西；libdrm 无符号版本、新版向后兼容，被系统
+#      gbm 引用到也不会错配。
 #===============================================================================
 set -euo pipefail
 
@@ -2033,11 +2039,24 @@ if [ "$GL_BUILT" = 1 ]; then
               usr/local/share/rk-hwaccel/glfallback/lib/libEGL.so.1; do
     printf '%s\n' "$LIST" | grep -qx "$need" || die "tar 内缺 $need（GL 兜底层未入包）"
   done
-  for poison in libdrm.so.2 libgbm.so.1 libEGL.so.1 libGLESv2.so.2; do
+  # 黑名单只收 mesa 自家的东西：gbm/EGL/GLES 与系统 libdrm、X11、wayland 是编译期 ABI
+  # 耦合的，落进 $PREFIX/lib 会 shadow 系统 mesa，跨目录混装最容易出"能加载但花屏"。
+  # libdrm 故意不在名单里：它是本包刻意装进 $PREFIX/lib 的运行时依赖（Step 2 断言它必须
+  # 就位、mpv 直接链接它、RUNPATH 指向这里），且 libdrm 不做符号版本化、新版向后兼容，
+  # 被系统 mesa 引用到也不会错配。早先把它列进来等于和 Step 2 互相打架：CI 上
+  # "GL 兜底：84 个 .so"全绿之后，就是被这条自相矛盾的检查在收尾处判死的。
+  for poison in libgbm.so.1 libEGL.so.1 libGLESv2.so.2; do
     # 用 if 而不是 "grep && die"：set -e 下 grep 未命中（正是正常情况）会连带整脚本退出
-    if printf '%s\n' "$LIST" | grep -qx "usr/local/lib/$poison"; then
-      die "usr/local/lib/$poison 不该存在：mesa 只允许落在 glfallback/，进主库目录会 shadow 系统 mesa"
-    fi
+    # lib64 也扫：发行版/构建参数不同，主目录可能落在这里，判据不该跟着变
+    for dir in usr/local/lib usr/local/lib64; do
+      if printf '%s\n' "$LIST" | grep -qx "$dir/$poison"; then
+        die "$dir/$poison 不该存在：mesa 只允许落在 glfallback/，进主库目录会 shadow 系统 mesa"
+      fi
+      if [ "$poison" = libgbm.so.1 ] && printf '%s\n' "$LIST" | grep -q "^$dir/libgallium"; then
+        # gallium 实体名带版本号（libgallium-24.2.8.so），只能前缀匹配
+        die "$dir/libgallium-* 不该存在：mesa 只允许落在 glfallback/"
+      fi
+    done
   done
   log "  GL 兜底入包：$(printf '%s\n' "$LIST" | grep -c 'glfallback/.*\.so' || true) 个 .so"
 fi
