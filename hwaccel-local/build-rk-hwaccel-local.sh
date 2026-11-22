@@ -146,6 +146,11 @@
 #      补装按 openEuler 的包名 python3-pyyaml 走，候选名逐个试并逐个回验 import，
 #      全都不上才降级为"不带兜底层"。同时修掉 Step 11 自检的误判——它拿固定路径
 #      ^#!/bin/bash 比对，而内嵌脚本一律是 #!/usr/bin/env bash，任何构建都会 die。
+#  18) CI 第四轮"驱动名就位"之后无提示 exit 1：依赖闭包那段在 set -e + pipefail 下
+#      被 ldd 的非 0 退出码击穿——find -type f 把 lib/pkgconfig/*.pc 也交给 ldd，
+#      ldd 撞非 ELF 返回 1，这个 1 顺着 while 循环体传到外层管道，整包构建连 GATE-GL
+#      都没跑到就死了（第三轮其实是同一个坑，被上面临近的自补失败掩盖了）。
+#      改为只扫 *.so* 且让 gl_scan 显式吞掉非 0；cp 失败也只记降级不 die。
 #===============================================================================
 set -euo pipefail
 
@@ -780,22 +785,29 @@ if [ "$GL_BUILT" = 1 ]; then
   # glibc/libstdc++ 之类必须跟系统走，永不打包（否则和内核 ABI 打架）。
   gl_seed() { for b in mpv ffmpeg ffprobe; do [ -e "$STAGE$PREFIX/bin/$b" ] && printf '%s\n' "$STAGE$PREFIX/bin/$b"; done; }
   gl_scan() {  # 把 ldd 输出里"解析到 $PREFIX 之外"的依赖路径打出来
-    LD_LIBRARY_PATH="$FB/lib:$STAGE$PREFIX/lib" ldd "$1" 2>/dev/null | awk -v pfx="$STAGE$PREFIX/" '
+    # 结尾的 || true 是必需的：构建脚本开了 set -e + pipefail，而 ldd 撞上非 ELF 文件
+    # （兜底目录里的 *.pc、meson 生成的脚本）会返回 1，这个 1 会顺着 while 循环体的
+    # 状态一路传到外层管道，把整包构建静默带走——CI 上"驱动名就位"之后无提示 exit 1
+    # 就是这么来的（连 GATE-GL 都没跑到）。
+    { LD_LIBRARY_PATH="$FB/lib:$STAGE$PREFIX/lib" ldd "$1" 2>/dev/null | awk -v pfx="$STAGE$PREFIX/" '
       NF>=4 && $2=="=>" && $3 !~ /^\/$/ && $3 !~ /^not/ {
         if ($3 ~ "^"pfx) next
         if ($3 ~ /\/(libc|libm|libdl|libpthread|librt|libresolv|libutil|libanl|libnsl|libstdc\+\+|libgcc_s|ld-linux)[^/]*\.so/) next
         print $3
-      }'
+      }'; } || true
   }
   round=0
   while [ "$round" -lt 20 ]; do
     round=$((round+1)); changed=0
-    { gl_seed; find "$FB/lib" -maxdepth 2 -type f 2>/dev/null; } | while read -r f; do gl_scan "$f"; done \
-      | sort -u > "$WORK/gl-want.txt"
+    # 只扫共享对象：-type f 会把 lib/pkgconfig/*.pc 也算进来，那些不是 ELF
+    { gl_seed; find "$FB/lib" -maxdepth 2 -type f -name '*.so*' 2>/dev/null; } \
+      | while read -r f; do gl_scan "$f"; done | sort -u > "$WORK/gl-want.txt"
     while read -r src; do
       [ -e "$src" ] || continue
       dst="$FB/lib/$(basename "$src")"
-      [ -e "$dst" ] || { cp -L "$src" "$FB/lib/" && changed=1; }
+      if [ ! -e "$dst" ]; then
+        cp -L "$src" "$FB/lib/" && changed=1 || log "  [降级] 依赖闭包抄不进 $dst"
+      fi
     done < "$WORK/gl-want.txt"
     [ "$changed" = 1 ] || break
   done
