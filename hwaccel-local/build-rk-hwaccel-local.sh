@@ -179,6 +179,12 @@
 #      不该有假错误 → 本机用不了的 gpu-context 值改为注释行，说明"换板子重生成时自动
 #      放开"（本文件每次开机/热插拔重生成，Valhall 板自然拿到可用值）。x11egl/wayland
 #      同闸：按 CTX_X11/CTX_WL 判定，本 mpv 没编的上下文不再裸发。
+#  23) 跑分表里 "AFBC+RGA" 与 "GLES零拷贝" 五只片子数字一字不差——查出来 MPV_AFBC=1
+#      这条"强制"开关在有机型的板子上根本进不去：闸门写的是 [ "$GPU" = no ] && ...，
+#      而本板 GL=bundle 判成 GPU=yes，于是整个 RGA 分支被跳过，测的还是 GLES 路径。
+#      改为 MPV_AFBC=1 可穿透 GPU=yes（默认行为不变，仍只在无 GPU 时自动启用），并在
+#      强制时打一行说明，免得日志里看不出这条是用户按出来的。补 7 例端到端用例：
+#      有/无 GPU × 10/8bit × 强制/不强制 × 缺 /dev/rga，覆盖"默认不发、强制必发"。
 #===============================================================================
 set -euo pipefail
 
@@ -1602,10 +1608,14 @@ fi
 # HEVC 4K60-10bit 的 vo=null 纯解码在 copy/零拷贝/AFBC/AFBC+RGA 四种组合下都是
 # 0.41~0.42x，瓶颈在 VDU 解码本身（该芯片 10bit 4K 约 25fps 上限）。
 # 需要 /dev/rga；有 GPU 的桌面会话不走这条（见上面的位深分叉）。
-if [ "$GPU" = no ] && { [ "$IS10" = yes ] || [ "${MPV_AFBC:-0}" = 1 ]; }; then
+# MPV_AFBC=1 是"强制"开关，得能穿透 GPU=yes：板上实测（RK3576 + 包内 mesa，GPU=yes）
+# 只按 GPU=no 判的话，这一档静默退回 GLES 路径，跑分表里 "AFBC+RGA" 与 "GLES零拷贝"
+# 五行数字一字不差——测的根本不是想测的东西。默认仍只在无 GPU 时启用。
+if { [ "$GPU" = no ] || [ "${MPV_AFBC:-0}" = 1 ]; } && { [ "$IS10" = yes ] || [ "${MPV_AFBC:-0}" = 1 ]; }; then
   if [ "$RGA_NODE" = yes ]; then
     VO_ARGS="$VO_ARGS --vd-lavc-o=afbc=on"
     VFS="scale_rkrga=force_yuv=8bit${VFS:+,$VFS}"   # 先转格式，再降帧
+    [ "$GPU" = yes ] && dlog "AFBC+RGA 由 MPV_AFBC=1 强制启用（本机有 GPU，默认不走这条）"
     dlog "AFBC+RGA：rkmpp 压帧 → RGA 转 NV12/NV16（10bit=$IS10）"
   else
     dlog "10bit/AFBC 需求但无 /dev/rga：跳过 RGA 转换"
