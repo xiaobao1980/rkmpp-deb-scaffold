@@ -185,6 +185,24 @@
 #      改为 MPV_AFBC=1 可穿透 GPU=yes（默认行为不变，仍只在无 GPU 时自动启用），并在
 #      强制时打一行说明，免得日志里看不出这条是用户按出来的。补 7 例端到端用例：
 #      有/无 GPU × 10/8bit × 强制/不强制 × 缺 /dev/rga，覆盖"默认不发、强制必发"。
+#  24) 承 23 继续查 AFBC/RGA：强制能穿透之后，四档数字仍然一模一样。板上真跑定位到
+#      根因——scale_rkrga 在这套 vendor 内核 + 本包 mpv 上根本建立不起来：
+#        [ffmpeg] Impossible to convert between the formats supported by the filter
+#                 'mpv_src_default_in' and the filter 'auto_scale_0'
+#        [lavfi]  failed to configure the filter graph
+#        Disabling filter scale_rkrga.00 because it has failed.
+#      copy/零拷贝/8bit/10bit/加不加 afbc=on 五种组合 5/5 全灭，ffmpeg CLI 直接喂
+#      nv12、nv15 也同样接不上（"Unrecognised hwaccel output format: rkmpp"）。也就是说
+#      我们只是把参数发出去，mpv 随即静默退回 CPU 的 swscale，日志却像走了硬件。
+#      新增开机探针 RGA_FILTER（真跑 3 帧判定，结论缓存一天，RK_RGA_FILTER=yes|no 可
+#      手工覆盖）：判不可用就不发 --vf/--vd-lavc-o，并把原因和"怎么强行试/怎么重探"打出来。
+#  25) 顺带更正 23 里引用的一条旧结论（"瓶颈在 VDU，10bit 4K 约 25fps 上限"是桌面时代
+#      的数据）：同一支 4K60-10bit HEVC 用本包 ffmpeg 纯硬解实测 81fps（1.35x），VDU
+#      有余量；真正卡住的是 mpv 的取帧+GLES 送显——按 (已播×源fps−丢帧)/墙钟 算实际送显
+#      帧率：1080p→1080p 11.5fps、4K8bit→1080p 7.2fps、4K8bit→4K 3.9fps、
+#      4K10bit→1080p 3.5fps、4K10bit→4K 接近 0。--profile=fast 对这几档无差别。
+#      另修 install.sh 的"生效档位"：它扫全文件，把档位菜单里的 vo=gpu-next/hwdec=rkmpp
+#      也算成生效配置，现在只读第一个 [xxx] 之前的全局段。
 #===============================================================================
 set -euo pipefail
 
@@ -1260,10 +1278,65 @@ else
   esac
 fi
 
+# ---------- RGA 滤镜能力探针（RGA_FILTER）----------
+# 有 /dev/rga、ffmpeg 也列出 rkrga 滤镜，都不等于 mpv 能用上它。
+# RK3576 vendor 6.1 + 本包 mesa/mpv 实测：--vf=scale_rkrga=… 在 mpv 的滤镜图里 100%
+# 建立失败（"Impossible to convert between the formats supported by the filter
+# 'mpv_src_default_in' and the filter 'auto_scale_0'" → "Disabling filter
+# scale_rkrga.00"），ffmpeg CLI 直接喂 nv12/nv15 同样接不上；结果就是参数发出去了、
+# 实际静默退回 CPU 的 swscale——日志看着像走了 RGA，比不发更糟。所以这里真跑 3 帧判定，
+# 结论缓存一天（探针要起 mpv，不能每次播放都跑）。
+# 手工覆盖：RK_RGA_FILTER=yes|no|auto（auto=按探针；测试与排障用）
+RGA_FILTER=unknown; RGA_FILTER_WHY=""
+rga_filter_probe() {
+  local cache="" d out ff mp tmpf
+  case "${RK_RGA_FILTER:-auto}" in
+    yes) RGA_FILTER=yes; RGA_FILTER_WHY="手工指定 RK_RGA_FILTER=yes"; return 0 ;;
+    no)  RGA_FILTER=no;  RGA_FILTER_WHY="手工指定 RK_RGA_FILTER=no";  return 0 ;;
+  esac
+  [ "$RGA_NODE" = yes ] || { RGA_FILTER=no; RGA_FILTER_WHY="无 /dev/rga"; return 0; }
+  for d in /run/lock /var/tmp /tmp; do [ -w "$d" ] && { cache="$d/rk-hwaccel-rga-filter"; break; }; done
+  if [ -n "$cache" ] && [ -r "$cache" ]; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    [ "$age" -ge 0 ] && [ "$age" -lt 86400 ] && {
+      RGA_FILTER=$(cat "$cache" 2>/dev/null); RGA_FILTER_WHY="缓存(${age}s 前)"
+      case "$RGA_FILTER" in yes|no) return 0 ;; esac
+    }
+  fi
+  mp=${MPV_BIN:-mpv}; ff=${MPV_BIN%mpv}/ffmpeg; [ -x "$ff" ] || ff=ffmpeg
+  command -v "$mp" >/dev/null 2>&1 || command -v "$ff" >/dev/null 2>&1 || {
+    RGA_FILTER=unknown; RGA_FILTER_WHY="找不到 mpv/ffmpeg"; return 0; }
+  # 32x32、半秒的探针片：只关心滤镜图能不能连上，画质与编解码器都无所谓
+  tmpf=$(mktemp "${TMPDIR:-/tmp}/rkrga-probe.XXXXXX.mp4") || {
+    RGA_FILTER=unknown; RGA_FILTER_WHY="建不了临时文件"; return 0; }
+  if ! "$ff" -v error -y -f lavfi -i "color=c=gray:s=32x32:r=10:d=0.5" \
+        -c:v libx264 -pix_fmt yuv420p -an "$tmpf" 2>/dev/null; then
+    "$ff" -v error -y -f lavfi -i "color=c=gray:s=32x32:r=10:d=0.5" \
+        -c:v mpeg4 -q:v 8 -an "$tmpf" 2>/dev/null || {
+      rm -f "$tmpf"; RGA_FILTER=unknown; RGA_FILTER_WHY="探针片生成失败（无可用编码器）"; return 0; }
+  fi
+  # --vo=null/--ao=null：不碰 DRM master，开机或别人正在播放都能探
+  out=$(LD_LIBRARY_PATH="${GL_LIBDIR:-}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        timeout 15 "$mp" --no-config --really-quiet --vo=null --ao=null \
+        --hwdec=rkmpp-copy --frames=3 --msg-level=vf=v \
+        --vf=scale_rkrga=force_yuv=8bit "$tmpf" 2>&1)
+  rm -f "$tmpf"
+  if grep -q 'Disabling filter scale_rkrga' <<<"$out"; then
+    RGA_FILTER=no;  RGA_FILTER_WHY="scale_rkrga 滤镜图建立失败，mpv 会静默退回 CPU 缩放"
+  elif grep -q 'scale_rkrga' <<<"$out"; then
+    RGA_FILTER=yes; RGA_FILTER_WHY="滤镜图建立成功"
+  else
+    RGA_FILTER=unknown; RGA_FILTER_WHY="探针无结论（可能缺 rkmpp 解码器）"
+  fi
+  [ -n "$cache" ] && printf '%s\n' "$RGA_FILTER" > "$cache" 2>/dev/null
+  return 0
+}
+rga_filter_probe
+
 # ---------- 输出：KEY="VALUE"，可直接 . / eval 载入 ----------
 [ "${1:-}" = "--quiet" ] && exit 0
 for k in DISTRO_NAME DISTRO_ID DISTRO_VER DISTRO_CODENAME FAMILY PKG \
-         KERNEL KERNEL_VENDOR CHIP MPP_NODE RGA_NODE LIBDIRS \
+         KERNEL KERNEL_VENDOR CHIP MPP_NODE RGA_NODE RGA_FILTER RGA_FILTER_WHY LIBDIRS \
          SESSION DE DM XV GPU GPU_DRV GPU_NODE GPU_WHY GBM MPV_BIN \
          GPU_MODEL GPU_ARCH GPU_SOC GPU_TAG VK_CAP VK_OK VK_LD VK_WHY \
          GL_SRC GLFALL GLFALL_DIR GL_LIBDIR GL_DRIDIR GL_VKICD GL_GPU GL_DRIVER GL_WHY \
@@ -1411,7 +1484,9 @@ echo "  GPU 依据    : 渲染节点 $(awk -F'"' '/^GPU_NODE=/{print $2}' "$ENV_
 echo "  mpv 能力面  : $(awk -F'"' '/^VO_DRM=/{printf "tty直出vo=drm=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^CTX_DSVK=/{printf "displayvk=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^CTX_WL=/{printf "wayland=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^VK_CAP=/{printf "PanVK代际=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^VO_GN=/{printf "gpu-next=%s",$2}' "$ENV_SNAP")"
 echo "  GL 用户态   : $(awk -F'"' '/^GL_SRC=/{print $2}' "$ENV_SNAP") 可用DRI=$(awk -F'"' '/^GL_DRIVER=/{print $2}' "$ENV_SNAP")$(awk -F'"' '/^GL_GPU=/{g=$2} /^GL_WHY=/{if(g=="no"&&$2)printf "（原因：%s）",$2}' "$ENV_SNAP")$(awk -F'"' '/^GL_SRC=/{d=$2} /^GL_LIBDIR=/{if(d=="bundle")printf "，包内兜底：%s",$2}' "$ENV_SNAP")  GPU=$(awk -F'"' '/^GPU_TAG=/{print $2}' "$ENV_SNAP")  档位=$(awk -F'"' '/^PROFILE=/{print $2}' "$ENV_SNAP")"
 echo "  未解析依赖  : $(LD_LIBRARY_PATH="$VLD" ldd /usr/local/bin/mpv 2>/dev/null | grep -c 'not found')（已把包内 GL 兜底算进搜索路径）"
-echo "  生效档位    : $(awk -F= '/^profile|^vo|^hwdec|^drm-mode|^ao/{printf "%s ",$0}' /usr/local/etc/mpv/mpv.conf 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i~/^(vo|hwdec|drm-mode|ao)=/) printf "%s ",$i}')"
+# 只读档位段之前的全局段：碰到第一个 [xxx] 就停。早先扫全文件，把"手工覆盖用的档位"
+# 菜单里的 vo=gpu-next/hwdec=rkmpp 也算进"生效档位"，看着像同时生效了四五种配置。
+echo "  生效档位    : $(awk '/^\[/{exit} /^(vo|hwdec|drm-mode|ao|profile|scale|drm-format)=/{printf "%s ",$0}' /usr/local/etc/mpv/mpv.conf 2>/dev/null)"
 
 cat <<MSG
 
@@ -1427,7 +1502,9 @@ cat <<MSG
 上游口径的手动档（https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Rendering#mpv）：
   零拷贝直出(需 GPU) : mpv-auto <片源>          # tty 用 vo=drm(GLES)，桌面用会话上下文；
                                                  # 仅 Valhall+ 且构建时 PLACEBO_VULKAN=1 才用 displayvk
-  10bit 无 GPU 直出: MPV_AFBC=1 mpv-auto <片源>   # RGA 把 10bit 转成 KMS 能显示的 8bit（正确性，非提速）
+  10bit 无 GPU 直出: MPV_AFBC=1 mpv-auto <片源>   # 让 RGA 把 10bit 转成 KMS 能显示的 8bit；
+                                                 # 是否真能走 RGA 由开机探针判定（rk-hwaccel-env 里
+                                                 # RGA_FILTER），本机用不上时会明说并退回原路径
 硬解负载观察：
   echo 1000 > /proc/mpp_service/load_interval ; watch -n 1 cat /proc/mpp_service/load
 MSG
@@ -1456,7 +1533,7 @@ RK_ENV=${RK_ENV:-/usr/local/bin/rk-hwaccel-env}
 if [ -x "$RK_ENV" ]; then
   # 键必须列全：GL_SRC/GL_LIBDIR 这些不在里面的话，兜底层判定永远读不到，
   # 裸机（系统无 mesa）的 mpv 连加载都失败（v2.3 之前的真实缺陷）
-  eval "$("$RK_ENV" 2>/dev/null | grep -E '^(SESSION|GPU|GPU_DRV|GPU_MODEL|GPU_ARCH|GPU_SOC|GPU_TAG|GBM|XV|RGA_NODE|SCREEN_4K|SCREEN_NATIVE|PROFILE|VO_GN|VO_DRM|CTX_WL|CTX_DSVK|VK_ICD|VK_OK|VK_WHY|GL_SRC|GL_LIBDIR|GL_DRIDIR|GL_VKICD|GL_GPU|GL_DRIVER|GL_WHY|MPV_BIN)=' )" || true
+  eval "$("$RK_ENV" 2>/dev/null | grep -E '^(SESSION|GPU|GPU_DRV|GPU_MODEL|GPU_ARCH|GPU_SOC|GPU_TAG|GBM|XV|RGA_NODE|RGA_FILTER|RGA_FILTER_WHY|SCREEN_4K|SCREEN_NATIVE|PROFILE|VO_GN|VO_DRM|CTX_WL|CTX_DSVK|VK_ICD|VK_OK|VK_WHY|GL_SRC|GL_LIBDIR|GL_DRIDIR|GL_VKICD|GL_GPU|GL_DRIVER|GL_WHY|MPV_BIN)=' )" || true
   [ -n "${MPV_BIN:-}" ] && MPV="$MPV_BIN"
 fi
 [ -n "$MPV" ] && [ -x "$MPV" ] || MPV=/usr/local/bin/mpv
@@ -1478,7 +1555,7 @@ elif [ -n "${DISPLAY:-}" ]; then
 else
   SESSION=tty
 fi
-dlog "环境: SESSION=$SESSION GPU=$GPU/${GPU_DRV:-none}(${GPU_TAG:-代际未知}) GBM=$GBM GL=${GL_SRC:-none}/驱动=${GL_DRIVER:-none} Xv=$XV 屏4K=$SCREEN_4K RGA=$RGA_NODE 档位=${PROFILE:-未探测}"
+dlog "环境: SESSION=$SESSION GPU=$GPU/${GPU_DRV:-none}(${GPU_TAG:-代际未知}) GBM=$GBM GL=${GL_SRC:-none}/驱动=${GL_DRIVER:-none} Xv=$XV 屏4K=$SCREEN_4K RGA=节点${RGA_NODE:-?}/滤镜${RGA_FILTER:-?} 档位=${PROFILE:-未探测}"
 [ "${GL_GPU:-yes}" = no ] && [ -n "${GL_WHY:-}" ] && dlog "  GL 不可用原因：$GL_WHY"
 
 # 开机调优的长期开关在这里同样生效，避免"mpv.conf 被 tune 设成 1080p、mpv-auto 却各自为政"
@@ -1604,21 +1681,26 @@ fi
 
 # AFBC + RGA（上游 Rendering 文档）：10bit 帧由 RGA 硬件转成 8bit，让无 GPU 的 KMS 直出
 # 能消费 nv15/nv20（不转换就是 "No such pixel type" 或 CPU 逐帧转，实测 0.4x 卡死）。
-# 注意定位：这条是"能不能放"的正确性开关，不是提速开关——RK3576 板上实测
-# HEVC 4K60-10bit 的 vo=null 纯解码在 copy/零拷贝/AFBC/AFBC+RGA 四种组合下都是
-# 0.41~0.42x，瓶颈在 VDU 解码本身（该芯片 10bit 4K 约 25fps 上限）。
 # 需要 /dev/rga；有 GPU 的桌面会话不走这条（见上面的位深分叉）。
 # MPV_AFBC=1 是"强制"开关，得能穿透 GPU=yes：板上实测（RK3576 + 包内 mesa，GPU=yes）
 # 只按 GPU=no 判的话，这一档静默退回 GLES 路径，跑分表里 "AFBC+RGA" 与 "GLES零拷贝"
 # 五行数字一字不差——测的根本不是想测的东西。默认仍只在无 GPU 时启用。
+# 但"发参数"不等于"走 RGA"：RK3576 vendor 6.1 实测 scale_rkrga 在 mpv 的滤镜图里
+# 建立失败（详见探针 RGA_FILTER），mpv 会打 "Disabling filter scale_rkrga.00" 后静默
+# 用 swscale，日志看着却像走了硬件。所以这条改由 RGA_FILTER 决定，探针说不能用就不发。
+# 另更正一处旧结论：这里原先写"瓶颈在 VDU（10bit 4K 约 25fps 上限）"，是桌面时代的数据；
+# 板上同一支 4K60-10bit HEVC 用本包 ffmpeg 纯硬解实测 81fps（1.35x），VDU 有余量，
+# 真正卡住的是 mpv 的取帧+GLES 送显（满帧 5.6fps、降到 30fps 目标也只有 11.6fps）。
 if { [ "$GPU" = no ] || [ "${MPV_AFBC:-0}" = 1 ]; } && { [ "$IS10" = yes ] || [ "${MPV_AFBC:-0}" = 1 ]; }; then
-  if [ "$RGA_NODE" = yes ]; then
+  if [ "${RGA_FILTER:-unknown}" = yes ]; then
     VO_ARGS="$VO_ARGS --vd-lavc-o=afbc=on"
     VFS="scale_rkrga=force_yuv=8bit${VFS:+,$VFS}"   # 先转格式，再降帧
     [ "$GPU" = yes ] && dlog "AFBC+RGA 由 MPV_AFBC=1 强制启用（本机有 GPU，默认不走这条）"
     dlog "AFBC+RGA：rkmpp 压帧 → RGA 转 NV12/NV16（10bit=$IS10）"
   else
-    dlog "10bit/AFBC 需求但无 /dev/rga：跳过 RGA 转换"
+    dlog "AFBC+RGA 跳过：RGA_FILTER=${RGA_FILTER:-unknown}（${RGA_FILTER_WHY:-未探测}）"
+    dlog "  这条不是提速开关；探针判定本机 scale_rkrga 用不上，发出去只会静默退回 CPU 缩放"
+    dlog "  想强行试：RK_RGA_FILTER=yes MPV_AFBC=1 mpv-auto <片源>；重探：删 /run/lock/rk-hwaccel-rga-filter"
   fi
 fi
 [ -n "$VFS" ] && VO_ARGS="$VO_ARGS --vf=$VFS"
@@ -1887,6 +1969,8 @@ tmp=$(mktemp)
   # （RK3576 实测）。0.41 上配置文件里的 [profile] 可直接用 --profile=rk-xxx 选中。
   echo
   echo "# ---- 手工覆盖用的档位（mpv --profile=rk-xxx ...）----"
+  # RGA 滤镜的实测结论直接写进配置，省得有人照着档位菜单试了半天其实没走硬件
+  printf '# RGA 滤镜(AFBC+RGA 路径)本机判定: %s（%s）\n' "${RGA_FILTER:-unknown}" "${RGA_FILTER_WHY:-未探测}"
   # 全量菜单 + 本机可用性标注：留着别的板子的档位方便拷贝配置，但把在本机必然起不来的
   # 那条标出来——尤其 rk-drm-gpu，Bifrost（G52/G31）上没有 PanVK，选中就是黑屏。
   n_drm="";  [ "${VO_DRM:-yes}" = no ] && n_drm="已装 mpv 没有 vo=drm"
