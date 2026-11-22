@@ -164,6 +164,14 @@
 #      .so 才算核心库"；老那条还有个副产物：[^/] 只有 GNU awk 认，BSD awk 直接报
 #      nonterminated character class，现在两边都能跑。install.sh 的 rpm 包名映射同步补
 #      lame/mpg123——照 SONAME 拼出来的 libmp3lame 在 openEuler 上不存在。
+#  21) RK3576 裸 openEuler 实板装机（v2.3 首个产物）抓到的两个真缺陷：
+#      a. 补用户组用的是空格分隔，usermod 把 "video render input audio" 当成一个组名
+#         直接报错，四个组一个都没加进去（非 root 跑 mpv 就拿不到 renderD/mpp_service）
+#         → 改逗号列表；
+#      b. 装机 5/5 自检的 mpv/ffmpeg 能力查询没带包内 GL 兜底：裸板系统无 libgbm/libEGL，
+#         连 --help 都加载失败，于是报"0 个解码器 / 0 项 hwdec / 未解析依赖 9"——全是假
+#         阴性（手工带 $GLF 复查是 10 解码器、3 rkrga、20 hwdec、ldd 零缺件）。探针在
+#         v2.3 第 4 条已改过，验证段漏了 → 统一走 VLD（含 $GLF）。
 #===============================================================================
 set -euo pipefail
 
@@ -1371,19 +1379,25 @@ if [ $# -ge 1 ]; then
 fi
 
 step "5/5 验证"
-mpv_flags() { LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64 /usr/local/bin/mpv --no-config "$@"; }
+# 查询必须和探针一样带上包内 GL 兜底：裸板系统没有 libgbm/libEGL，不带兜底连 mpv --help
+# 都加载失败，于是"0 项 rkmpp hwdec / 0 个解码器 / 未解析依赖 9"全是假阴性（板上实测：
+# 同一台机器手工带上 $GLF 再查是 10 个解码器、3 个 rkrga 滤镜、20 项 hwdec、ldd 零缺件）。
+VLD="/usr/local/lib:/usr/local/lib64"
+[ -d "$GLF" ] && VLD="$VLD:$GLF"
+mpv_flags() { LD_LIBRARY_PATH="$VLD" /usr/local/bin/mpv --no-config "$@"; }
+ff_flags()  { LD_LIBRARY_PATH="$VLD" /usr/local/bin/ffmpeg -hide_banner "$@"; }
 # 注意：本段在 set -o pipefail 下执行，一律用 awk 收敛输出，不用 head（避免 SIGPIPE 141）
 echo "  发行版      : $(awk -F'"' '/^DISTRO_NAME=/{print $2}' "$ENV_SNAP" 2>/dev/null)"
 echo "  内核/芯片   : $(awk -F'"' '/^KERNEL=/{print $2}' "$ENV_SNAP") / $(awk -F'"' '/^CHIP=/{print $2}' "$ENV_SNAP")"
 echo "  会话/桌面   : $(awk -F'"' '/^SESSION=/{print $2}' "$ENV_SNAP") / $(awk -F'"' '/^DE=/{print $2}' "$ENV_SNAP")"
 echo "  GPU/GBM/Xv  : $(awk -F'"' '/^GPU=/{print $2}' "$ENV_SNAP") / $(awk -F'"' '/^GBM=/{print $2}' "$ENV_SNAP") / $(awk -F'"' '/^XV=/{print $2}' "$ENV_SNAP")"
 echo "  显示器      : $(awk -F'"' '/^SCREEN_CONN=/{print $2}' "$ENV_SNAP") $(awk -F'"' '/^SCREEN_NATIVE=/{print $2}' "$ENV_SNAP")"
-echo "  ffmpeg      : $(/usr/local/bin/ffmpeg -hide_banner -decoders 2>/dev/null | grep -c '_rkmpp') 个 *_rkmpp 解码器, $(/usr/local/bin/ffmpeg -hide_banner -filters 2>/dev/null | grep -c rkrga) 个 rkrga 滤镜"
+echo "  ffmpeg      : $(ff_flags -decoders 2>/dev/null | grep -c '_rkmpp') 个 *_rkmpp 解码器, $(ff_flags -filters 2>/dev/null | grep -c rkrga) 个 rkrga 滤镜"
 echo "  mpv         : $(mpv_flags --hwdec=help 2>/dev/null | grep -c rkmpp) 项 rkmpp hwdec；ao=$(mpv_flags --ao=help 2>&1 | tr '\n' ' ' | grep -ow alsa | awk 'NR==1')；vo=$(mpv_flags --vo=help 2>/dev/null | tr '\n' ' ' | awk '{for(i=1;i<=NF;i++) if($i=="drm"||$i=="gpu-next"||$i=="wlshm"||$i=="xv") printf "%s ",$i}')"
 echo "  GPU 依据    : 渲染节点 $(awk -F'"' '/^GPU_NODE=/{print $2}' "$ENV_SNAP") 驱动 $(awk -F'"' '/^GPU_DRV=/{print $2}' "$ENV_SNAP")（sysfs 绑定，mesa25 的 gallium-loader 让 DRI 文件 inode 判断不可信）"
 echo "  mpv 能力面  : $(awk -F'"' '/^VO_DRM=/{printf "tty直出vo=drm=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^CTX_DSVK=/{printf "displayvk=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^CTX_WL=/{printf "wayland=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^VK_CAP=/{printf "PanVK代际=%s ",$2}' "$ENV_SNAP")$(awk -F'"' '/^VO_GN=/{printf "gpu-next=%s",$2}' "$ENV_SNAP")"
 echo "  GL 用户态   : $(awk -F'"' '/^GL_SRC=/{print $2}' "$ENV_SNAP") 可用DRI=$(awk -F'"' '/^GL_DRIVER=/{print $2}' "$ENV_SNAP")$(awk -F'"' '/^GL_GPU=/{g=$2} /^GL_WHY=/{if(g=="no"&&$2)printf "（原因：%s）",$2}' "$ENV_SNAP")$(awk -F'"' '/^GL_SRC=/{d=$2} /^GL_LIBDIR=/{if(d=="bundle")printf "，包内兜底：%s",$2}' "$ENV_SNAP")  GPU=$(awk -F'"' '/^GPU_TAG=/{print $2}' "$ENV_SNAP")  档位=$(awk -F'"' '/^PROFILE=/{print $2}' "$ENV_SNAP")"
-echo "  未解析依赖  : $(ldd /usr/local/bin/mpv 2>/dev/null | grep -c 'not found')"
+echo "  未解析依赖  : $(LD_LIBRARY_PATH="$VLD" ldd /usr/local/bin/mpv 2>/dev/null | grep -c 'not found')（已把包内 GL 兜底算进搜索路径）"
 echo "  生效档位    : $(awk -F= '/^profile|^vo|^hwdec|^drm-mode|^ao/{printf "%s ",$0}' /usr/local/etc/mpv/mpv.conf 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i~/^(vo|hwdec|drm-mode|ao)=/) printf "%s ",$i}')"
 
 cat <<MSG
@@ -1745,10 +1759,12 @@ if [ "$AUTO_GROUPS" = 1 ]; then
   for u in $(awk -F: '$3>=1000 && $3<60000 && $7!~/(nologin|false)$/ {print $1}' /etc/passwd); do
     add=""
     for g in video render input audio; do
-      id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" || add="$add $g"
+      # 逗号拼：usermod -aG 只吃"一个参数里的逗号列表"，空格分隔会被当成一个组名，
+      # 板上实测报 usermod: group 'video render input audio' does not exist，四个组一个没加
+      id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" || add="${add:+$add,}$g"
     done
-    if [ -n "${add// /}" ]; then
-      run usermod -aG "${add# }" "$u" && say "用户 $u 补组:$add（已登录会话需重新登录生效）"
+    if [ -n "$add" ]; then
+      run usermod -aG "$add" "$u" && say "用户 $u 补组: $add（已登录会话需重新登录生效）"
     fi
   done
 fi
