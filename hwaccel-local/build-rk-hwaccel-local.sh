@@ -145,6 +145,11 @@ LIBPLACEBO_VER="6.338.2"           # mpv 0.41 的下限；与板上已验证产�
 LIBDISPLAY_INFO_VER="0.2.0"
 DAV1D_VER="1.5.4"                  # AV1 软解兜底
 MPV_MESON_MIN="1.3.0"
+# mpv 0.41 对 wayland-protocols 的真实下限是 1.41（不是它 meson 里写的 1.31，原因见 Step 9）；
+# 补装取 1.47=mpv 自身门禁的最高档，已逐条核对 mpv 要的全部 XML 在该版目录里都存在
+# （1.41+ 把 linux-dmabuf/tablet 提升进 stable，但 unstable 副本照样安装，mpv 的老路径不会断）
+WAYLAND_PROTOCOLS_MIN="1.41"
+WAYLAND_PROTOCOLS_VER="1.47"
 
 # ---------------- GL 兜底包（裸 vendor 镜像用）------------------------------
 # 现场实测：openEuler 24.03 SP4 vendor 板全盘无 libdrm/libgbm/libEGL，mpv 连加载都失败
@@ -234,11 +239,13 @@ src_url() {  # $1=镜像内的文件名 $2=官方 URL
   if [ -n "$MIRROR" ]; then printf '%s/%s' "${MIRROR%/}" "$1"; else printf '%s' "$2"; fi
 }
 
+# 版本号比较：ver_ge 实际 最低要求 —— 缺包时传 "0"，恒小于任何真实版本
+ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
+
 # meson 版本门禁：mpv 0.41 要求 meson>=1.3.0，openEuler/Debian 老仓库可能不满足
 ensure_meson() {
   local need="$1" have
   have=$(meson --version 2>/dev/null || echo 0)
-  ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
   ver_ge "$have" "$need" && { log "  meson $have 满足要求"; return 0; }
   log "  meson $have < $need，用 pip 升级"
   dnf install -y python3-pip >/dev/null 2>&1 || apt-get install -y python3-pip >/dev/null 2>&1 || true
@@ -265,8 +272,9 @@ else
   rm -rf "$STAGE"; mkdir -p "$STAGE$PREFIX"
   # staging 从空开始 → tar 内容只含本次构建产物；真实 /usr/local 的历史残留不会混入
 fi
-# openEuler 是 lib64 体系，pkg-config 默认不搜 /usr/local/lib{,64}/pkgconfig
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+# openEuler 是 lib64 体系，pkg-config 默认不搜 /usr/local/lib{,64}/pkgconfig；
+# share/pkgconfig 也要给——wayland-protocols 的 .pc 按上游就装在 $datadir/pkgconfig 下
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 ensure_meson "$MPV_MESON_MIN"
 
@@ -290,6 +298,7 @@ dnf_install() {
 dnf_install \
   gcc gcc-c++ make cmake meson ninja-build git pkgconf patch \
   nasm yasm perl python3 python3-pip patchelf \
+  bison flex python3-packaging \
   curl tar gzip which diffutils \
   zlib-devel bzip2-devel xz-devel \
   alsa-lib-devel \
@@ -504,6 +513,77 @@ log "Step 9/11 编译 mpv ($MPV_TAG，三显示后端 + alsa + gpu-next)"
 cd "$WORK"
 fetch_src mpv mpv.tar.gz "$MPV_TAG" "$MPV_REPO"
 rm -rf build-mpv
+
+# 为什么这里要管 wayland-protocols（CI 上曾死在 mpv 的 292/298）：
+#   mpv 的 video/out/meson.build 只有当协议包 >= 1.41 时才生成
+#   staging/color-management/color-management-v1.xml（它 meson 里写的下限是 1.31，是假的），
+#   可 wayland_common.c 的 hdr_metadata_valid()（v0.41.0 第 3285 行）漏了没包在
+#   #if HAVE_WAYLAND_PROTOCOLS_1_41 里，直接调只存在于生成头的 wp_color_manager_v1_get_version()。
+#   协议包偏旧的发行版（openEuler 24.03 实测 1.33）里这个符号根本不存在，而 GCC 14 起
+#   implicit-function-declaration 默认按错误处理，编到最后一个 wayland 文件必然中断。
+#   补的这份只有 XML 和 .pc，不产生任何运行库，因此只装在构建机、不进产物 tar。
+bundle_wayland_protocols() {
+  local have d url xml
+  have=$(pkg-config --modversion wayland-protocols 2>/dev/null || echo 0)
+  if ver_ge "$have" "$WAYLAND_PROTOCOLS_MIN"; then
+    log "  系统 wayland-protocols $have 已满足 mpv（>= $WAYLAND_PROTOCOLS_MIN），不动它"
+    return 0
+  fi
+  log "  系统 wayland-protocols $have 过旧（mpv $MPV_TAG 需 >= $WAYLAND_PROTOCOLS_MIN），构建期补装 $WAYLAND_PROTOCOLS_VER"
+  d="wayland-protocols-$WAYLAND_PROTOCOLS_VER"
+  if [ ! -d "$WORK/$d" ]; then
+    cd "$WORK" || return 1
+    # 只给 archive 地址：freedesktop 上 wayland-protocols 的 release 没有 downloads 资产
+    # （和 libdisplay-info 那次 404 同一类坑），archive 才是稳定的取包路径
+    url=$(src_url "$d.tar.gz" \
+      "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/$WAYLAND_PROTOCOLS_VER/$d.tar.gz")
+    curl -fSL --max-time 300 "$url" -o /tmp/wp.tar.gz \
+      || { log "  拉取失败：$url"; return 1; }
+    rm -rf /tmp/wp && mkdir -p /tmp/wp
+    tar xzf /tmp/wp.tar.gz -C /tmp/wp || { rm -rf /tmp/wp /tmp/wp.tar.gz; log "  解包失败"; return 1; }
+    [ -d "/tmp/wp/$d" ] || { log "  顶层目录不是 $d"; rm -rf /tmp/wp; return 1; }
+    rm -rf "$WORK/$d" && mv "/tmp/wp/$d" "$WORK/$d"
+  fi
+  # 它的 meson 用 dependency('wayland-scanner') 取扫描器；有的发行版只装程序不给 .pc，
+  # 就按实测版本补一个只在构建期生效的 pc 文件（同样只写进 $PREFIX，不改系统目录）
+  if ! pkg-config --exists wayland-scanner 2>/dev/null; then
+    local sv
+    sv=$(wayland-scanner --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+    [ -n "$sv" ] || { log "  找不到 wayland-scanner 或读不到它的版本"; return 1; }
+    if ! ver_ge "$sv" "1.20.0"; then
+      log "  wayland-scanner $sv 过旧（补装的协议包在关掉自带测试时要求 >= 1.20）"
+      return 1
+    fi
+    mkdir -p "$PREFIX/share/pkgconfig"
+    printf 'prefix=%s\nwayland_scanner=%s\n\nName: Wayland Scanner\nDescription: Wayland scanner\nVersion: %s\n' \
+      "$PREFIX" "$(command -v wayland-scanner)" "$sv" \
+      > "$PREFIX/share/pkgconfig/wayland-scanner.pc"
+    log "  已生成构建期用的 wayland-scanner.pc（版本 $sv）"
+  fi
+  rm -rf "build-$d"
+  # -Dtests=false：跳过协议包自带的测试（那会额外要求 wayland-scanner>=1.23），
+  # 协议文件的安装不受这个开关影响
+  meson setup "build-$d" "$d" --prefix="$PREFIX" -Dtests=false \
+    || { log "  wayland-protocols meson 配置失败"; return 1; }
+  ninja -C "build-$d" || { log "  wayland-protocols 构建失败"; return 1; }
+  # 这里刻意不用 do_install：产物 tar 里没有它的运行库，把协议文件收进去只是几百 KB 噪音
+  ninja -C "build-$d" install || { log "  wayland-protocols 安装失败"; return 1; }
+  have=$(pkg-config --modversion wayland-protocols 2>/dev/null || echo 0)
+  ver_ge "$have" "$WAYLAND_PROTOCOLS_MIN" \
+    || { log "  补装后 pkg-config 仍报 $have（$PREFIX/share/pkgconfig 没被优先取到）"; return 1; }
+  xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/staging/color-management/color-management-v1.xml"
+  [ -f "$xml" ] || { log "  缺 $xml"; return 1; }
+  log "  补装生效：wayland-protocols $have，color-management 协议就位"
+}
+
+# 补装失败就关 Wayland，而不是让整包构建断在最后一步：无桌面 tty 直出（vo=drm）不受影响，
+# Wayland 桌面会话里 mpv 退化成走 XWayland——比"没有可用 mpv"好，且日志里写明白原因
+WOPT=enabled
+bundle_wayland_protocols || {
+  WOPT=disabled
+  log "  [降级] mpv 按 -Dwayland=disabled 构建：Wayland 会话将走 XWayland；"
+  log "          要两全就装 $WAYLAND_PROTOCOLS_MIN+ 的 wayland-protocols-devel 再重编"
+}
 # RUNPATH 两目录都给：libav*/librockchip_mpp/librga/dav1d 在 lib，libmpv/libplacebo
 # 由各自 meson 决定，openEuler 上常见 lib64 —— 只写一个会漏
 # 0.41 的 meson.options 已无 libplacebo 选项（它变成硬依赖），再传 -Dlibplacebo 会
@@ -511,7 +591,7 @@ rm -rf build-mpv
 meson setup build-mpv mpv \
   --prefix="$PREFIX" --libdir=lib --buildtype=release \
   -Dcdda=disabled -Ddvdnav=disabled -Dlibbluray=disabled \
-  -Ddrm=enabled -Dgbm=enabled -Dwayland=enabled -Dx11=enabled \
+  -Ddrm=enabled -Dgbm=enabled -Dwayland="$WOPT" -Dx11=enabled \
   -Dalsa=enabled \
   -Dmanpage-build=disabled \
   -Dc_link_args="-Wl,-rpath,$PREFIX/lib:$PREFIX/lib64"
