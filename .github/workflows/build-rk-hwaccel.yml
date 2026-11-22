@@ -1,0 +1,62 @@
+# .github/workflows/build-rk-hwaccel.yml
+# 与 build.yml（Debian 12 基座的 deb 流水线）互不影响，这条是"免打包直发型"：
+#   hwaccel-local/build-rk-hwaccel-local.sh   单一构建脚本，产出 tar.gz + install.sh
+#   产物只依赖 rk35xx vendor 内核的 /dev/mpp_service，openEuler/deepin/Debian/Ubuntu 通用
+# 触发：Actions 页手动 Run workflow，或打 v* tag（自动出 Release）
+name: build-rk-hwaccel-local
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    # 托管 arm64 原生运行器：公共仓库免费（4 vCPU/16G），私有仓库免费额度内可用（2 vCPU/8G）
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    container:
+      # 关键：作业容器用 openEuler 24.03，保证 glibc 2.38 基线，产物才能回 openEuler 跑
+      # 直接裸跑 ubuntu-24.04-arm 会得到 glibc 2.39 产物，openEuler 目标机无法加载
+      image: openeuler/openeuler:24.03
+    env:
+      # 留 1 核给 ssh/Actions 通信，避免构建把机器打满导致 job 失联
+      JOBS: 3
+    steps:
+      - name: 容器内补装 git/tar（openeuler 基础镜像可能不含，checkout、拉源码、打包都要）
+        run: dnf install -y git tar
+
+      - uses: actions/checkout@v4
+
+      - name: 一键编译（源码直连 github；容器内无 /dev/mpp_service，跳过设备门禁）
+        env:
+          SKIP_MPP_CHECK: '1'
+          # MIRROR 默认为空=直连 github/code.videolan.org；内网自建镜像时改成
+          # MIRROR: 'http://192.168.60.101:8000'
+        run: bash hwaccel-local/build-rk-hwaccel-local.sh
+
+      - name: 产物清单（tar 内含开机自适应四件套：rk-hwaccel-env / rk-hwaccel-tune /
+               rk-hwaccel-tune.service / 热插拔 udev 规则 / mpv-auto）
+        run: |
+          ls -l /opt/rk-local-out
+          cat /opt/rk-local-out/VERIFY.txt
+
+      - name: 上传产物 Artifact（tar + sha256 + install.sh + VERIFY.txt，保留 90 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk-hwaccel-local-${{ github.ref_name }}
+          path: |
+            /opt/rk-local-out/rk-hwaccel-local-*.tar.gz
+            /opt/rk-local-out/rk-hwaccel-local-*.tar.gz.sha256
+            /opt/rk-local-out/install.sh
+            /opt/rk-local-out/VERIFY.txt
+          if-no-files-found: error
+
+      - name: 打 tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            /opt/rk-local-out/rk-hwaccel-local-*.tar.gz
+            /opt/rk-local-out/rk-hwaccel-local-*.tar.gz.sha256
+            /opt/rk-local-out/install.sh
