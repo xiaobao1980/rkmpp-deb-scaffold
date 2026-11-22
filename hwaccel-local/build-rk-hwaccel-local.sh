@@ -203,6 +203,18 @@
 #      4K10bit→1080p 3.5fps、4K10bit→4K 接近 0。--profile=fast 对这几档无差别。
 #      另修 install.sh 的"生效档位"：它扫全文件，把档位菜单里的 vo=gpu-next/hwdec=rkmpp
 #      也算成生效配置，现在只读第一个 [xxx] 之前的全局段。
+#  26) 开机主线真跑一次才发现的大问题：rk-hwaccel-tune.service 从来没成功过。
+#      journalctl 里是这两行：
+#        rk-hwaccel-env: line 230: HOME: unbound variable
+#        rk-hwaccel-tune: line 37: DISTRO_ID: unbound variable
+#      根因：探针扫用户级 Vulkan ICD 目录时写了裸 $HOME，而 systemd 服务环境里没有 HOME，
+#      脚本又是 set -u，于是探针整段死掉；tune 拿到空输出后在下一个变量上再崩，报错完全
+#      指不到根因。此前看到的 mpv.conf 全是 install.sh 那一次生成的，"开机重算"其实一直
+#      没生效——而这正是本次交付要验证的那条。修法两层：
+#        a. 用户级目录一律 ${HOME:+…}，HOME 不存在就跳过该候选项；
+#        b. tune 先把探针输出收进变量，查退出码与有没有 PROFILE=，探针挂了要明确报
+#           "探针 X 退出码 N / 没给出结论"，而不是崩在无关变量上。
+#      同类裸读已全量排查：$DISPLAY 那处本来就有 ${DISPLAY:-} 保护，其余没有。
 #===============================================================================
 set -euo pipefail
 
@@ -1138,7 +1150,10 @@ CTX_DSVK=no; hasw displayvk "$GPU_CTX" && CTX_DSVK=yes    # gpu-next 的 tty Vul
 # 系统目录没有、但包内兜底层带了一份时也算数——那时由 mpv-auto 用 VK_ICD_FILENAMES 指过去。
 VK_ICD=no
 [ -n "$GL_VKICD" ] && VK_ICD=yes
-for d in /usr/share/vulkan/icd.d /etc/vulkan/icd.d "$HOME/.local/share/vulkan/icd.d"; do
+# 用户级 ICD 目录要 ${HOME:+…} 而不是 "$HOME/…"：systemd 服务环境里没有 HOME，
+# 脚本是 set -u，裸 $HOME 会当场 "HOME: unbound variable" 让探针整段死掉
+# （开机服务 rk-hwaccel-tune.service 实测就是这么失败的）
+for d in /usr/share/vulkan/icd.d /etc/vulkan/icd.d ${HOME:+"$HOME/.local/share/vulkan/icd.d"}; do
   ls "$d"/*.json >/dev/null 2>&1 && { VK_ICD=yes; break; }
 done
 # ICD 文件在 ≠ 起得来设备：PanVK 只覆盖 Valhall 及以后，Bifrost（G52/G31）装了 json
@@ -1778,7 +1793,12 @@ FORCE_1080P=1      # 4K 屏 + 无 GPU 时 DRM 强制 1080p 输出（实测流畅
 RK_ENV=${RK_ENV:-/usr/local/bin/rk-hwaccel-env}
 [ -x "$RK_ENV" ] || { say "探针缺失（$RK_ENV），跳过调优"; exit 1; }
 [ -e /dev/mpp_service ] || { say "无 /dev/mpp_service：非 vendor 内核，不做任何改动"; exit 0; }
-eval "$("$RK_ENV")"   # SESSION/GPU/GBM/XV/SCREEN_*/PROFILE/CTX_*/VK_ICD...（必须命令替换；直接 eval 路径等于只把探针打印出来）
+# 探针输出先收进变量再 eval：直接 eval "$(...)" 时探针若中途死掉（set -u 下踩到未设
+# 变量、脚本被截断等），tune 会在下一行的 ${DISTRO_ID} 上再崩一次，报错完全指不到根因。
+ENV_OUT=$("$RK_ENV" 2>&1); ENV_RC=$?
+[ "$ENV_RC" = 0 ] || { say "探针 $RK_ENV 退出码 $ENV_RC：$(tail -1 <<<"$ENV_OUT")"; exit 1; }
+grep -q '^PROFILE=' <<<"$ENV_OUT" || { say "探针 $RK_ENV 没给出结论（输出 $(wc -l <<<"$ENV_OUT") 行）：$(tail -2 <<<"$ENV_OUT" | tr '\n' ' ')"; exit 1; }
+eval "$ENV_OUT"   # SESSION/GPU/GBM/XV/SCREEN_*/PROFILE/CTX_*/VK_ICD...（必须命令替换；直接 eval 路径等于只把探针打印出来）
 say "触发=$REASON 发行版=$DISTRO_ID($FAMILY) 会话=$SESSION 桌面=$DE GPU=$GPU/${GPU_DRV:-none} GBM=$GBM GL=${GL_SRC:-none}/${GL_DRIVER:-none} 屏=${SCREEN_CONN:-未接}(${SCREEN_NATIVE:-无}) 档位=$PROFILE"
 
 run() { [ "$DRY" = 1 ] && { say "  [dry-run] $*"; return 0; }; "$@"; }
