@@ -295,7 +295,7 @@ dnf_install \
   alsa-lib-devel \
   gnutls-devel libass-devel freetype-devel fribidi-devel harfbuzz-devel fontconfig-devel \
   libpng-devel libjpeg-turbo-devel lcms2-devel \
-  libdrm-devel mesa-libEGL-devel mesa-libGLES-devel mesa-libGL-devel mesa-libgbm-devel \
+  libdrm-devel mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel \
   hwdata \
   libxkbcommon-devel wayland-devel wayland-protocols-devel \
   libX11-devel libXext-devel libXinerama-devel libXrandr-devel libXv-devel \
@@ -422,15 +422,34 @@ do_install ninja -C build-libdisplay-info install
 #------------------------- Step 7 libplacebo（mpv gpu-next 硬依赖）------------
 log "Step 7/11 编译 libplacebo ($LIBPLACEBO_VER)"
 cd "$WORK"
-[ -d "libplacebo-$LIBPLACEBO_VER" ] || {
-  LP_URL=$(src_url "libplacebo-v$LIBPLACEBO_VER.tar.gz" \
-    "https://code.videolan.org/videolan/libplacebo/-/archive/v$LIBPLACEBO_VER/libplacebo-v$LIBPLACEBO_VER.tar.gz")
-  curl -fSL "$LP_URL" -o "/tmp/libplacebo.tar.gz" || die "libplacebo 源码拉取失败：$LP_URL"
-  tar xf /tmp/libplacebo.tar.gz
-  # videolan archive 顶层目录带 v 前缀，统一成无 v 的目录名
-  [ -d "libplacebo-$LIBPLACEBO_VER" ] || mv -f "libplacebo-v$LIBPLACEBO_VER" "libplacebo-$LIBPLACEBO_VER"
-  [ -d "libplacebo-$LIBPLACEBO_VER" ] || die "libplacebo 解包后目录名不对（顶层应为 libplacebo-v$LIBPLACEBO_VER）"
-}
+if [ ! -d "libplacebo-$LIBPLACEBO_VER" ]; then
+  # GL 头文件是构建期由 vendored glad 现生成的，而 glad/jinja/markupsafe 都是 git
+  # submodule：gitlab 的 archive tarball 里它们是空目录，meson 会在
+  # src/opengl/include/glad/meson.build 报 "glad (required: >= 2.0, found: none)
+  # was not found in PYTHONPATH or 3rdparty"（CI 上 Step 7 首次就死在这）。
+  # 所以首选带子模块的 git 拉取；只有离线镜像才回退 tar，且回退后必须本机已有 glad。
+  LP_GIT="https://code.videolan.org/videolan/libplacebo.git"
+  [ -n "$MIRROR" ] && LP_GIT="${MIRROR%/}/libplacebo.git"
+  if git clone --depth 1 --branch "v$LIBPLACEBO_VER" "$LP_GIT" "libplacebo-$LIBPLACEBO_VER" 2>/dev/null; then
+    git -C "libplacebo-$LIBPLACEBO_VER" submodule update --init --depth 1 \
+      3rdparty/glad 3rdparty/jinja 3rdparty/markupsafe 3rdparty/fast_float \
+      || log "  [提示] 子模块未全部就位，下面按实际缺的再判"
+  else
+    log "  git 拉取失败，回落 tarball（$MIRROR 或官方 archive）"
+    LP_URL=$(src_url "libplacebo-v$LIBPLACEBO_VER.tar.gz" \
+      "https://code.videolan.org/videolan/libplacebo/-/archive/v$LIBPLACEBO_VER/libplacebo-v$LIBPLACEBO_VER.tar.gz")
+    curl -fSL "$LP_URL" -o /tmp/libplacebo.tar.gz || die "libplacebo 源码拉取失败：$LP_URL"
+    tar xf /tmp/libplacebo.tar.gz
+    [ -d "libplacebo-$LIBPLACEBO_VER" ] || mv -f "libplacebo-v$LIBPLACEBO_VER" "libplacebo-$LIBPLACEBO_VER"
+  fi
+fi
+# 判据与 libplacebo 自己一致：要么 3rdparty/glad 里有包，要么系统 python 能 import glad
+if [ ! -s "libplacebo-$LIBPLACEBO_VER/3rdparty/glad/glad/__init__.py" ] \
+   && ! python3 -c 'import glad; assert glad.__version__ >= "2.0"' 2>/dev/null; then
+  die "libplacebo 缺 GL 头文件生成器 glad：子模块没拉下来（离线镜像的 tarball 不含 submodule）。
+      修法一：git -C $WORK/libplacebo-$LIBPLACEBO_VER submodule update --init --depth 1 3rdparty/glad 3rdparty/jinja 3rdparty/markupsafe
+      修法二：pip3 install 'glad>=2.0'（要有网）；两者都不行就只能放弃 GLES 档"
+fi
 rm -rf build-libplacebo
 # vulkan 默认关：省掉 glslang/shaderc 全链，代价是 mpv 没有 displayvk 上下文。
 # 这不是损失——tty 的 GPU 直出用 vo=drm（自带 GBM/EGL，GLES 即可），displayvk 只在
