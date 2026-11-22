@@ -138,7 +138,10 @@
 #  16) 同理拦下 Step 10 的两处：swrast 在 mesa 24.2 里是 softpipe,llvmpipe 的别名，
 #      llvm=disabled 时 llvmpipe 是硬错误（改用 softpipe，也避免兜底层链上裸板没有的
 #      libLLVM.so）；且 mesa 24 的 gallium 只有一个 libgallium-<版本>.so，驱动名靠
-#      链接，上游只给 va/vdpau 建链接 → 构建后按 loader 要的名字自补。
+#      链接，上游只给 va/vdpau 建链接 → 构建后按 loader 要的名字自补。CI 又实测：
+#      mesa 把实体装进 glfallback/lib，而 configure 的 "Driver dir" 指 glfallback/lib/dri
+#      且该目录根本不创建，所以自补要自己 mkdir + 相对软链；libgallium 整体缺失时
+#      撤回兜底层而不是 die（硬解照出，直出退到 KMS 拷帧档）。
 #  17) CI 实测 Step 10 还差 PyYAML（mesa meson.build:967 是硬 error，不是可选依赖）：
 #      补装按 openEuler 的包名 python3-pyyaml 走，候选名逐个试并逐个回验 import，
 #      全都不上才降级为"不带兜底层"。同时修掉 Step 11 自检的误判——它拿固定路径
@@ -738,20 +741,36 @@ fi
 # libgallium-*.so，下面 GATE-GL 的 "缺 lib/dri/*_dri.so" 会当场 die，比到目标机上
 # 才发现强。上游哪天自己把链接建了，这里逐名判存在、自动跳过。
 if [ "$GL_BUILT" = 1 ]; then
-  DRI_DIR=$(find "$FB" -maxdepth 3 -type d -name dri 2>/dev/null | head -1)
-  GALLIUM=$(find "${DRI_DIR:-$FB}" "$FB/lib" -maxdepth 1 -name 'libgallium*.so*' -type f 2>/dev/null | head -1)
-  if [ -z "$DRI_DIR" ] || [ -z "$GALLIUM" ]; then
-    log "  [降级] 兜底层里没同时找到 dri 目录与 libgallium*.so，不补驱动名链接"
-  elif [ "$(dirname "$GALLIUM")" != "$DRI_DIR" ]; then
-    log "  [注意] libgallium 在 $(dirname "$GALLIUM")、dri 目录是 $DRI_DIR——不同目录不补名，请核对 mesa 安装布局"
+  # CI 实测的安装布局：实体在 glfallback/lib/libgallium-<版本>.so，configure 打出的
+  # "Driver dir" 却是 glfallback/lib/dri——上游根本不往那里装东西，目录压根不存在
+  # （第一版自补逻辑用 find 找现成的 dri 目录，于是必然找不到）。改成按编译进去的
+  # 路径自己建目录 + 相对软链；$prefix 是绝对路径，loader 的默认搜索路径已指向这里，
+  # 不依赖 LIBGL_DRIVERS_PATH（探针仍然设它，属双保险）。
+  GALLIUM=$(find "$FB/lib" -maxdepth 1 -name 'libgallium*.so*' -type f 2>/dev/null | head -1)
+  DRI_DIR="$FB/lib/dri"
+  if [ -z "$GALLIUM" ]; then
+    # 连 libgallium 都没有 = gallium 的 DRI 前端没产出，这块兜底是废铁（loader 只会静默
+    # 回落软 raster）。与其让 GATE-GL 把 25 分钟的整包构建拖死，不如明确撤回：产物照出，
+    # 无桌面直出退回 KMS 拷帧档（rk-drm），硬解仍然生效。
+    log "  [降级] 兜底层里没有 libgallium*.so：撤回 GL 兜底，产物照常出（直出退到 rk-drm 档）"
+    rm -rf "$FB"
+    GL_BUILT=0
+    GL_NOTE="（未附带：mesa 的 DRI 前端未产出 libgallium）"
   else
+    mkdir -p "$DRI_DIR"
     for n in panfrost swrast kms_swrast; do
-      [ -e "$DRI_DIR/${n}_dri.so" ] && continue
-      ln -f "$GALLIUM" "$DRI_DIR/${n}_dri.so" 2>/dev/null \
-        || ln -sf "$(basename "$GALLIUM")" "$DRI_DIR/${n}_dri.so" \
+      if [ -e "$DRI_DIR/${n}_dri.so" ]; then continue; fi   # 上游哪天自己建了就跳过
+      ln -sfn "../$(basename "$GALLIUM")" "$DRI_DIR/${n}_dri.so" 2>/dev/null \
+        || ln -f "$GALLIUM" "$DRI_DIR/${n}_dri.so" \
         || log "  [降级] 建不出 ${n}_dri.so"
     done
-    log "  驱动名就位（$(basename "$GALLIUM") 的链接）：$(cd "$DRI_DIR" && ls | tr '\n' ' ')"
+    # 建完回读：断链 dlopen 只会静默回落成软 raster，比缺文件难查得多
+    for n in panfrost swrast kms_swrast; do
+      if [ ! -e "$DRI_DIR/${n}_dri.so" ]; then
+        log "  [降级] ${n}_dri.so 指不到实体文件（相对软链目标丢了？）"
+      fi
+    done
+    log "  驱动名就位：$(cd "$DRI_DIR" && ls | tr '\n' ' ')→ $(basename "$GALLIUM")"
   fi
 fi
 
