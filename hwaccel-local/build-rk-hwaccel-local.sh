@@ -286,6 +286,7 @@ dnf_install() {
   [ ${#missing[@]} -gt 0 ] && printf '%s\n' "${missing[@]}" > "$WORK/missing-deps.txt"
   return 0
 }
+# hwdata 不是 -devel 包，但 libdisplay-info 编 EDID 厂商表要读 /usr/share/hwdata/pnp.ids
 dnf_install \
   gcc gcc-c++ make cmake meson ninja-build git pkgconf patch \
   nasm yasm perl python3 python3-pip patchelf \
@@ -295,6 +296,7 @@ dnf_install \
   gnutls-devel libass-devel freetype-devel fribidi-devel harfbuzz-devel fontconfig-devel \
   libpng-devel libjpeg-turbo-devel lcms2-devel \
   libdrm-devel mesa-libEGL-devel mesa-libGLES-devel mesa-libGL-devel mesa-libgbm-devel \
+  hwdata \
   libxkbcommon-devel wayland-devel wayland-protocols-devel \
   libX11-devel libXext-devel libXinerama-devel libXrandr-devel libXv-devel \
   libXScrnSaver-devel libXpresent-devel libXfixes-devel \
@@ -404,6 +406,13 @@ cd "$WORK"
   fi
   [ -d "libdisplay-info-$LIBDISPLAY_INFO_VER" ] || die "libdisplay-info 源码未就位：tar 与 git 两条路都不通"
 }
+# libdisplay-info 的 meson.build 会用 hwdata.pc 或直接读 /usr/share/hwdata/pnp.ids 生成
+# PNP 厂商表；两样都没有时 meson 只甩一句 "File /usr/share/hwdata/pnp.ids does not exist"，
+# 看不出是缺数据包。这里先补装再断言，报错说清该装什么。
+if [ ! -e /usr/share/hwdata/pnp.ids ]; then
+  dnf install -y hwdata >/dev/null 2>&1 || apt-get install -y hwdata >/dev/null 2>&1 || true
+fi
+[ -e /usr/share/hwdata/pnp.ids ] || die "缺 /usr/share/hwdata/pnp.ids：装 hwdata 包（libdisplay-info 生成显示器厂商表的输入）"
 rm -rf build-libdisplay-info
 meson setup build-libdisplay-info "libdisplay-info-$LIBDISPLAY_INFO_VER" \
   --prefix="$PREFIX" --libdir=lib --buildtype=release
@@ -485,6 +494,7 @@ meson setup build-mpv mpv \
   -Dcdda=disabled -Ddvdnav=disabled -Dlibbluray=disabled \
   -Ddrm=enabled -Dgbm=enabled -Dwayland=enabled -Dx11=enabled \
   -Dalsa=enabled \
+  -Dmanpage-build=disabled \
   -Dc_link_args="-Wl,-rpath,$PREFIX/lib:$PREFIX/lib64"
 ninja -C build-mpv
 do_install ninja -C build-mpv install
